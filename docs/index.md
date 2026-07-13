@@ -1,0 +1,3 @@
+# index
+
+See [[getting-started]]

@@ -1,0 +1,30 @@
+{
+  "name": "fangornmd",
+  "version": "1.0.0",
+  "description": "A personal, self-hosted HackMD-style wiki published to the Fangorn network",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,green \"pnpm dev:server\" \"pnpm dev:web\"",
+    "dev:server": "node --env-file=.env server/index.js",
+    "dev:web": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "graph": "node server/graph.js docs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.30.1",
+  "dependencies": {
+    "@fangorn-network/sdk": "2026.7.1-2.1",
+    "dompurify": "^3.4.12",
+    "marked": "^18.0.6",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.3",
+    "concurrently": "^10.0.3",
+    "vite": "^8.1.4"
+  }
+}
