@@ -6,9 +6,8 @@ Welcome. This page links back to the [home page](index.md).
 
 - click on the [+] button on the top left to open an empty markdown editor. 
 - add whatever you'd like
-- the underlying file structure (on your machine) store is flat - all files are side by side. You do not need to manage directories, instead all pages are simply connected using their links. To add a link to another page, you can use either formats:
-    - `[link text](markdown-file-to-link-to.md)` 
-    - `[[markdown-file-to-link-to]]`
+- the underlying file structure (on your machine) store is flat - all files are side by side. You do not need to manage directories, instead all pages are simply connected using their links. To add a link to another page, you can use:
+    - `[link text](markdown-file-to-link-to.md)`
 
 ### Publishing
 

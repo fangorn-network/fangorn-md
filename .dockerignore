@@ -1,0 +1,8 @@
+# node_modules is intentionally NOT ignored — the image copies it (see Dockerfile).
+.git
+.env
+.fangorn
+docs
+dist
+README.md
+commit.json

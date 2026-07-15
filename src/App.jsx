@@ -36,13 +36,81 @@ function TreeNode({ path, depth, tree, notes, active, onOpen }) {
     );
 }
 
+// The repo switcher: every tracked Fangorn namespace, plus inline forms to
+// create one on your own root (public or private/encrypted) or follow someone
+// else's read-only. A dot marks repos with an unseen on-chain update.
+function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow }) {
+    const [form, setForm] = useState(null); // "new" | "follow" | null
+    const [name, setName] = useState("");
+    const [visibility, setVisibility] = useState("public");
+    const [owner, setOwner] = useState("");
+
+    const submitNew = (e) => {
+        e.preventDefault();
+        if (!name.trim()) return;
+        onCreate(name.trim(), visibility);
+        setName(""); setVisibility("public"); setForm(null);
+    };
+    const submitFollow = (e) => {
+        e.preventDefault();
+        if (!owner.trim() || !name.trim()) return;
+        onFollow(owner.trim(), name.trim());
+        setName(""); setOwner(""); setForm(null);
+    };
+
+    return (
+        <div className="repo-bar">
+            <div className="repo-bar-head">
+                <span className="repo-bar-label">repos</span>
+                <span className="repo-bar-actions">
+                    <button className="btn ghost small" title="New repo" onClick={() => setForm(form === "new" ? null : "new")}>＋</button>
+                    <button className="btn ghost small" title="Follow a repo" onClick={() => setForm(form === "follow" ? null : "follow")}>⌕</button>
+                </span>
+            </div>
+            <div className="repo-switch">
+                {repos.map((r) => (
+                    <button
+                        key={r.namespace}
+                        className={`repo-item ${r.namespace === active ? "active" : ""}`}
+                        onClick={() => onSwitch(r.namespace)}
+                        title={`${r.namespace} · owner ${r.owner}`}
+                    >
+                        <span className="repo-name">{r.namespace}</span>
+                        {nudges[r.namespace] && r.namespace !== active && <span className="repo-dot" title="on-chain update" />}
+                        {r.visibility === "private" && <span className="repo-badge" title="private (encrypted)">🔒</span>}
+                        {!r.writable && <span className="repo-badge" title="read-only follow">👁</span>}
+                    </button>
+                ))}
+            </div>
+            {form === "new" && (
+                <form className="repo-form" onSubmit={submitNew}>
+                    <input className="repo-input" placeholder="namespace (e.g. images)" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+                    <select className="repo-input" value={visibility} onChange={(e) => setVisibility(e.target.value)}>
+                        <option value="public">public</option>
+                        <option value="private">private (encrypted)</option>
+                    </select>
+                    <button className="btn small primary" type="submit">Create</button>
+                </form>
+            )}
+            {form === "follow" && (
+                <form className="repo-form" onSubmit={submitFollow}>
+                    <input className="repo-input" placeholder="owner 0x…" value={owner} onChange={(e) => setOwner(e.target.value)} autoFocus />
+                    <input className="repo-input" placeholder="namespace" value={name} onChange={(e) => setName(e.target.value)} />
+                    <button className="btn small primary" type="submit">Follow</button>
+                </form>
+            )}
+        </div>
+    );
+}
+
 export default function App() {
-    const [repo, setRepo] = useState(null);
+    const [repos, setRepos] = useState([]); // all tracked repos
+    const [repo, setRepo] = useState(null); // the active one
     const [notes, setNotes] = useState([]);
     const [active, setActive] = useState(null);
     const [content, setContent] = useState("");
     const [saveState, setSaveState] = useState("saved"); // saved | unsaved | saving
-    const [remoteNudge, setRemoteNudge] = useState(null); // last on-chain NamespaceChange
+    const [nudges, setNudges] = useState({}); // namespace → last on-chain NamespaceChange
     const [status, setStatus] = useState(null); // { kind: ok|err|busy, text, tx? }
     const saveTimer = useRef(null);
     const dirtyRef = useRef(false);
@@ -61,22 +129,26 @@ export default function App() {
         setSaveState("saved");
     }, []);
 
-    // Boot: repo pointer + note list, then open the index (or the first note).
-    useEffect(() => {
-        (async () => {
-            try {
-                setRepo(await api.repo());
-                const list = await refreshNotes();
-                const first = list.find((n) => n.path === "index.md") ?? list[0];
-                if (first) await openNote(first.path);
-            } catch (err) {
-                setStatus({ kind: "err", text: `server unreachable: ${err.message}` });
-            }
-        })();
+    // Load the active repo's pointer + notes and open its index (or first note).
+    const loadActive = useCallback(async () => {
+        const { active: activeNs, repos } = await api.repos();
+        setRepos(repos);
+        setRepo(repos.find((r) => r.namespace === activeNs) ?? null);
+        const list = await refreshNotes();
+        const first = list.find((n) => n.path === "index.md") ?? list[0];
+        if (first) await openNote(first.path);
+        else { setActive(null); setContent(""); }
+        return activeNs;
     }, [refreshNotes, openNote]);
 
+    // Boot.
+    useEffect(() => {
+        loadActive().catch((err) =>
+            setStatus({ kind: "err", text: `server unreachable: ${err.message}` }));
+    }, [loadActive]);
+
     // Autosave: every keystroke marks the note dirty; 600ms of quiet flushes it
-    // to docs/ on disk. Publishing is a separate, explicit act.
+    // to disk. Publishing is a separate, explicit act.
     const onChange = (next) => {
         setContent(next);
         setSaveState("unsaved");
@@ -94,8 +166,8 @@ export default function App() {
     };
 
     useEvents({
-        // docs/ changed on disk (external editor, a pull): refresh the sidebar,
-        // and reload the open note unless there are unsaved edits to protect.
+        // The active repo's dir changed on disk (external editor, a pull):
+        // refresh the sidebar, reload the open note unless there are unsaved edits.
         onLocalChange: async () => {
             const list = await refreshNotes();
             if (active && !dirtyRef.current && list.some((n) => n.path === active)) {
@@ -103,16 +175,50 @@ export default function App() {
                 setContent((cur) => (dirtyRef.current ? cur : note.content));
             }
         },
-        // A new commit settled on-chain. Don't touch local files — just offer
-        // to pull. (Your own publishes echo back here too; pulling is a no-op.)
-        onRemoteChange: (change) => setRemoteNudge(change),
+        // A new commit settled on-chain for some tracked repo. Don't touch local
+        // files — just record the nudge, keyed by namespace.
+        onRemoteChange: (change) =>
+            setNudges((n) => ({ ...n, [change.namespace]: change })),
     });
+
+    const switchRepo = async (namespace) => {
+        if (namespace === repo?.namespace) return;
+        try {
+            await api.setActiveRepo(namespace);
+            await loadActive();
+        } catch (err) {
+            setStatus({ kind: "err", text: `switch failed: ${err.message}` });
+        }
+    };
+
+    const createRepo = async (namespace, visibility) => {
+        setStatus({ kind: "busy", text: `initializing ${namespace} on-chain…` });
+        try {
+            await api.createRepo(namespace, visibility);
+            await loadActive();
+            setStatus({ kind: "ok", text: `created ${namespace} (${visibility})` });
+        } catch (err) {
+            setStatus({ kind: "err", text: `create failed: ${err.message}` });
+        }
+    };
+
+    const followRepo = async (owner, namespace) => {
+        setStatus({ kind: "busy", text: `following ${namespace}…` });
+        try {
+            await api.followRepo(owner, namespace);
+            await loadActive();
+            setStatus({ kind: "ok", text: `following ${namespace} (read-only) — Pull to fetch notes` });
+        } catch (err) {
+            setStatus({ kind: "err", text: `follow failed: ${err.message}` });
+        }
+    };
 
     const pull = async () => {
         setStatus({ kind: "busy", text: "pulling from the network…" });
         try {
             const { written } = await api.pull();
-            setRemoteNudge(null);
+            setNudges((n) => { const c = { ...n }; delete c[repo?.namespace]; return c; });
+            await refreshNotes();
             setStatus({ kind: "ok", text: written.length ? `pulled ${written.length} note(s): ${written.join(", ")}` : "already up to date" });
         } catch (err) {
             setStatus({ kind: "err", text: `pull failed: ${err.message}` });
@@ -128,7 +234,7 @@ export default function App() {
             const r = await api.publish(message);
             setStatus({
                 kind: "ok",
-                text: `published commit ${short(r.commitCid)} (${r.staged.vertices} notes, ${r.staged.edges} links) in ${((Date.now() - started) / 1000).toFixed(1)}s`,
+                text: `published ${r.visibility} commit ${short(r.commitCid)} (${r.staged.vertices} notes, ${r.staged.edges} links) in ${((Date.now() - started) / 1000).toFixed(1)}s`,
                 tx: r.txHash,
             });
         } catch (err) {
@@ -161,6 +267,7 @@ export default function App() {
         path: p,
         title: notes.find((n) => n.path === p)?.title ?? p,
     }));
+    const activeNudge = repo && nudges[repo.namespace];
 
     return (
         <div className="app">
@@ -169,6 +276,14 @@ export default function App() {
                     <span className="brand">🌲 fangornmd</span>
                     <button className="btn small" onClick={newNote} title="New note">＋</button>
                 </div>
+                <RepoBar
+                    repos={repos}
+                    active={repo?.namespace}
+                    nudges={nudges}
+                    onSwitch={switchRepo}
+                    onCreate={createRepo}
+                    onFollow={followRepo}
+                />
                 <nav className="note-list">
                     {tree.root && (
                         <TreeNode
@@ -198,7 +313,7 @@ export default function App() {
                 </nav>
                 {repo && (
                     <footer className="repo-info">
-                        <div><b>{repo.namespace}</b> {repo.writable ? "· writable" : "· read-only clone"}</div>
+                        <div><b>{repo.namespace}</b> · {repo.visibility}{repo.writable ? "" : " · read-only"}</div>
                         <div title={repo.owner}>owner {short(repo.owner)}</div>
                         <div title={repo.head ?? ""}>head {repo.head ? short(repo.head) : "(none)"}</div>
                     </footer>
@@ -206,12 +321,12 @@ export default function App() {
             </aside>
 
             <main className="main">
-                {remoteNudge && (
+                {activeNudge && (
                     <div className="banner">
-                        Remote updated on-chain (block {remoteNudge.blockNumber},{" "}
-                        {remoteNudge.addedVertices?.length ?? 0} new version(s)).
+                        <b>{repo.namespace}</b> updated on-chain (block {activeNudge.blockNumber},{" "}
+                        {activeNudge.addedVertices?.length ?? 0} new version(s)).
                         <button className="btn" onClick={pull}>Pull</button>
-                        <button className="btn ghost" onClick={() => setRemoteNudge(null)}>Dismiss</button>
+                        <button className="btn ghost" onClick={() => setNudges((n) => { const c = { ...n }; delete c[repo.namespace]; return c; })}>Dismiss</button>
                     </div>
                 )}
                 <header className="topbar">
@@ -250,7 +365,7 @@ export default function App() {
                         )}
                     </>
                 ) : (
-                    <div className="empty">No notes yet — create one, or pull a cloned wiki.</div>
+                    <div className="empty">No notes yet — create one, or Pull if this is a followed repo.</div>
                 )}
             </main>
         </div>

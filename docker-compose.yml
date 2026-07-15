@@ -1,0 +1,14 @@
+# Run: docker compose up --build   (reads secrets from .env)
+#
+# The server needs .fangorn/repos.json to exist. On first run either init a repo
+# via the CLI first, or bring the stack up and create one from the UI.
+services:
+  fangornmd:
+    build: .
+    ports:
+      - "8787:8787"
+    env_file: .env
+    volumes:
+      - ./docs:/app/docs        # working tree (per-namespace note files)
+      - ./.fangorn:/app/.fangorn # repo store + local head pointers
+    restart: unless-stopped

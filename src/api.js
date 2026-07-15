@@ -16,6 +16,10 @@ const post = (url, body) =>
 
 export const api = {
     repo: () => fetch("/api/repo").then(json),
+    repos: () => fetch("/api/repos").then(json),
+    createRepo: (namespace, visibility) => post("/api/repos", { namespace, visibility }),
+    followRepo: (owner, namespace) => post("/api/repos/follow", { owner, namespace }),
+    setActiveRepo: (namespace) => post("/api/repos/active", { namespace }),
     notes: () => fetch("/api/notes").then(json),
     note: (path) => fetch(`/api/notes/${encodeURIComponent(path)}`).then(json),
     save: (path, content) =>
