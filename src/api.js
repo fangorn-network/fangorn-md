@@ -48,6 +48,15 @@ export const api = {
             headers: await authHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify({ content }),
         }).then(json),
+    deleteNote: async (path) =>
+        fetch(`/api/notes/${encodeURIComponent(path)}`, { method: "DELETE", headers: await authHeaders() }).then(json),
+    renameNote: (path, to) => post(`/api/notes/${encodeURIComponent(path)}/rename`, { to }),
+    saveTree: async (tree) =>
+        fetch("/api/tree", {
+            method: "PUT",
+            headers: await authHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({ tree }),
+        }).then(json),
     remote: () => get("/api/remote"),
     history: () => get("/api/history"),
     pull: () => post("/api/pull"),

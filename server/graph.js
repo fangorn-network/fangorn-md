@@ -1,4 +1,4 @@
-import { buildAssetGraph, extractMarkdownLinks } from "@fangorn-network/sdk";
+import { buildAssetGraph } from "@fangorn-network/sdk";
 
 // ─── Files → graph ────────────────────────────────────────────────────────────
 //
@@ -20,19 +20,31 @@ import { buildAssetGraph, extractMarkdownLinks } from "@fangorn-network/sdk";
 // `updatedAt` is only re-stamped when content differs from the latest remote
 // version, so an untouched note keeps a byte-identical payload (and CID)
 // across publishes. Pass the result of `latestByPath` as `remoteLatest`.
+//
+// EDGES come from the explicit page tree (`.tree.json`), not from markdown
+// links: `childrenByPath` maps a note's path → its child paths, and those are
+// the only edges published. The tree file itself rides along as a `meta` vertex
+// so followers reconstruct the exact hierarchy (order included) on pull.
 
-export function buildWikiGraph(dir, remoteLatest = new Map()) {
+const stampPayload = (remote, path, content) =>
+    remote && remote.payload.content === content
+        ? remote.payload
+        : { path, content, updatedAt: Date.now() };
+
+export function buildWikiGraph(dir, remoteLatest = new Map(), childrenByPath = new Map()) {
     return buildAssetGraph(dir, {
         processors: {
             ".md": (file) => {
                 const content = file.readText();
-                const remote = remoteLatest.get(file.name);
-                const payload =
-                    remote && remote.payload.content === content
-                        ? remote.payload
-                        : { path: file.name, content, updatedAt: Date.now() };
-                return { tag: "doc", payload, links: extractMarkdownLinks(content) };
+                const links = (childrenByPath.get(file.name) ?? []).map((p) => p.replace(/\.md$/, ""));
+                return { tag: "doc", payload: stampPayload(remoteLatest.get(file.name), file.name, content), links };
             },
+            // The tree manifest (.tree.json): a structure-only vertex, no edges.
+            ".json": (file) => ({
+                tag: "meta",
+                payload: stampPayload(remoteLatest.get(file.name), file.name, file.readText()),
+                links: [],
+            }),
         },
     });
 }

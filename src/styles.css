@@ -52,8 +52,41 @@ body {
 }
 .note-item:hover { background: var(--bg); }
 .note-item.active { background: var(--bg); outline: 1px solid var(--border); }
-.note-item.orphan { color: var(--text-dim); }
 .tree-glyph { color: var(--text-dim); font-family: ui-monospace, monospace; }
+
+/* ── Draggable page tree ─────────────────────────────── */
+.tree-row { position: relative; display: flex; align-items: center; border-radius: 6px; }
+.tree-row .note-item { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-row[draggable="true"] { cursor: grab; }
+.tree-actions {
+    display: none;
+    gap: 2px;
+    padding-right: 6px;
+}
+.tree-row:hover .tree-actions { display: flex; }
+.tree-act {
+    border: 0;
+    background: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 4px;
+    border-radius: 4px;
+}
+.tree-act:hover { background: var(--bg); color: var(--text); }
+/* Drop-zone feedback while dragging. */
+.tree-row.drop-inside { outline: 1px solid var(--accent); outline-offset: -1px; }
+.tree-row.drop-before::before,
+.tree-row.drop-after::after {
+    content: "";
+    position: absolute;
+    left: 6px;
+    right: 6px;
+    height: 2px;
+    background: var(--accent);
+}
+.tree-row.drop-before::before { top: -1px; }
+.tree-row.drop-after::after { bottom: -1px; }
 .tree-section {
     padding: 12px 10px 4px;
     font-size: 11px;
@@ -177,37 +210,25 @@ body {
     border-radius: 10px;
     font: 11px/1.6 ui-monospace, monospace;
 }
-.editor { flex: 1; display: flex; min-height: 0; }
+.editor { flex: 1; display: flex; min-height: 0; justify-content: center; overflow-y: auto; }
+/* Single reading pane: markdown renders in place (see Editor.jsx decorations). */
 .editor-input {
-    width: 50%;
-    padding: 20px;
+    width: 100%;
+    max-width: 760px;
+    padding: 32px 28px 45vh;
     border: 0;
-    border-right: 1px solid var(--border);
     outline: none;
-    overflow-y: auto;
     white-space: pre-wrap;
     word-break: break-word;
     background: var(--bg-input);
     color: var(--text);
-    font: 14px/1.7 ui-monospace, "Cascadia Code", Menlo, monospace;
+    font: 16px/1.75 system-ui, -apple-system, "Segoe UI", sans-serif;
 }
-.editor-preview {
-    width: 50%;
-    padding: 20px 28px;
-    overflow-y: auto;
-    line-height: 1.7;
-}
-.editor-preview h1, .editor-preview h2 { border-bottom: 1px solid var(--border); padding-bottom: 6px; }
-.editor-preview a { color: #539bf5; }
-.editor-preview code {
-    background: var(--bg-panel);
-    padding: 2px 5px;
-    border-radius: 4px;
-    font-size: 0.9em;
-}
-.editor-preview pre { background: var(--bg-panel); padding: 12px; border-radius: 8px; overflow-x: auto; }
-.editor-preview pre code { background: none; padding: 0; }
-.editor-preview blockquote { border-left: 3px solid var(--border); margin-left: 0; padding-left: 14px; color: var(--text-dim); }
+/* Markdown syntax markers: collapsed to zero width unless the caret is on the
+   line, so the text reads rendered but stays editable. */
+.md-syntax { font-size: 0; }
+.md-syntax-on { font-size: inherit; color: var(--text-dim); opacity: 0.6; }
+.md-link { color: #539bf5; cursor: pointer; }
 
 .backlinks {
     display: flex;

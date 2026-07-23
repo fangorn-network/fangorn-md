@@ -3,35 +3,70 @@ import { usePrivy, useWallets, useSignMessage } from "@privy-io/react-auth";
 import { api, setTokenGetter, setAddress } from "./api.js";
 import { deriveSecret, sealContent } from "./crypto.js";
 import { useEvents } from "./useEvents.js";
-import { buildTree, buildBacklinks } from "./structure.js";
+import { buildBacklinks, moveInTree } from "./structure.js";
 import Editor, { CollabEditor } from "./Editor.jsx";
 
 const short = (s) => (s ? `${s.slice(0, 8)}…${s.slice(-6)}` : "");
 
-// One node of the inferred wiki tree (see structure.js), rendered recursively.
-function TreeNode({ path, depth, tree, notes, active, onOpen }) {
-    const note = notes.find((n) => n.path === path);
-    if (!note) return null;
+// One node of the explicit page tree (stored server-side; see structure.js),
+// rendered recursively. Writers can drag to reorder/nest and rename/delete.
+function TreeRow({ node, depth, notes, active, writable, onOpen, onMove, onRename, onDelete }) {
+    const [zone, setZone] = useState(null); // "before" | "inside" | "after"
+    const title = notes.find((n) => n.path === node.path)?.title ?? node.path.replace(/\.md$/, "");
+
+    const onDragOver = (e) => {
+        if (!writable) return;
+        e.preventDefault();
+        const r = e.currentTarget.getBoundingClientRect();
+        const y = (e.clientY - r.top) / r.height;
+        setZone(y < 0.3 ? "before" : y > 0.7 ? "after" : "inside");
+    };
+    const onDrop = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const drag = e.dataTransfer.getData("text/path");
+        if (drag && zone) onMove(drag, node.path, zone);
+        setZone(null);
+    };
+
     return (
         <>
-            <button
-                className={`note-item ${path === active ? "active" : ""}`}
-                style={{ paddingLeft: `${10 + depth * 16}px` }}
-                onClick={() => onOpen(path)}
-                title={path}
+            <div
+                className={`tree-row ${zone ? `drop-${zone}` : ""}`}
+                draggable={writable}
+                onDragStart={(e) => e.dataTransfer.setData("text/path", node.path)}
+                onDragOver={onDragOver}
+                onDragLeave={() => setZone(null)}
+                onDrop={onDrop}
             >
-                <span className="tree-glyph">{depth > 0 ? "└ " : ""}</span>
-                {note.title}
-            </button>
-            {(tree.children.get(path) ?? []).map((child) => (
-                <TreeNode
-                    key={child}
-                    path={child}
+                <button
+                    className={`note-item ${node.path === active ? "active" : ""}`}
+                    style={{ paddingLeft: `${10 + depth * 16}px` }}
+                    onClick={() => onOpen(node.path)}
+                    title={node.path}
+                >
+                    <span className="tree-glyph">{depth > 0 ? "└ " : ""}</span>
+                    {title}
+                </button>
+                {writable && (
+                    <span className="tree-actions">
+                        <button className="tree-act" title="Rename" onClick={() => onRename(node.path)}>✎</button>
+                        <button className="tree-act" title="Delete" onClick={() => onDelete(node.path)}>✕</button>
+                    </span>
+                )}
+            </div>
+            {node.children.map((child) => (
+                <TreeRow
+                    key={child.path}
+                    node={child}
                     depth={depth + 1}
-                    tree={tree}
                     notes={notes}
                     active={active}
+                    writable={writable}
                     onOpen={onOpen}
+                    onMove={onMove}
+                    onRename={onRename}
+                    onDelete={onDelete}
                 />
             ))}
         </>
@@ -121,7 +156,10 @@ export default function App({ address, onLogout }) {
         await wallet.switchChain(tx.chainId);
         const provider = await wallet.getEthereumProvider();
         const params = { from: wallet.address, to: tx.to, data: tx.data };
-        // Explicit fees from the server (the wallet's own estimate runs too low).
+        // Explicit fees AND gas limit from the server, so the wallet never runs
+        // its own estimation — that's what shows as "Network fee Unavailable" when
+        // the public Arbitrum Sepolia RPC rate-limits eth_estimateGas.
+        if (tx.gas) params.gas = tx.gas;
         if (tx.maxFeePerGas) params.maxFeePerGas = tx.maxFeePerGas;
         if (tx.maxPriorityFeePerGas) params.maxPriorityFeePerGas = tx.maxPriorityFeePerGas;
         return provider.request({ method: "eth_sendTransaction", params: [params] });
@@ -139,6 +177,7 @@ export default function App({ address, onLogout }) {
     const [repos, setRepos] = useState([]); // all tracked repos
     const [repo, setRepo] = useState(null); // the active one
     const [notes, setNotes] = useState([]);
+    const [tree, setTree] = useState([]); // explicit page hierarchy (stored)
     const [active, setActive] = useState(null);
     const [content, setContent] = useState("");
     const [saveState, setSaveState] = useState("saved"); // saved | unsaved | saving
@@ -155,8 +194,9 @@ export default function App({ address, onLogout }) {
     dirtyRef.current = saveState !== "saved";
 
     const refreshNotes = useCallback(async () => {
-        const { notes } = await api.notes();
+        const { notes, tree } = await api.notes();
         setNotes(notes);
+        setTree(tree ?? []);
         return notes;
     }, []);
 
@@ -354,13 +394,49 @@ export default function App({ address, onLogout }) {
         }
     };
 
+    // Drag-and-drop reorder/nest: apply the move locally, then persist the whole
+    // tree. On failure, re-sync from the server so the sidebar can't drift.
+    const moveNote = async (dragPath, targetPath, pos) => {
+        const next = moveInTree(tree, dragPath, targetPath, pos);
+        if (next === tree) return;
+        setTree(next);
+        try { const { tree: saved } = await api.saveTree(next); setTree(saved); }
+        catch (err) { setStatus({ kind: "err", text: `move failed: ${err.message}` }); refreshNotes(); }
+    };
+
+    const renameNoteAt = async (path) => {
+        const to = window.prompt("Rename note to", path.replace(/\.md$/, ""));
+        if (!to) return;
+        try {
+            const { path: newPath } = await api.renameNote(path, to);
+            await refreshNotes();
+            if (active === path) await openNote(newPath);
+        } catch (err) {
+            setStatus({ kind: "err", text: `rename failed: ${err.message}` });
+        }
+    };
+
+    const deleteNoteAt = async (path) => {
+        if (!window.confirm(`Delete ${path}? It's removed from your working tree (published history is kept).`)) return;
+        try {
+            await api.deleteNote(path);
+            const list = await refreshNotes();
+            if (active === path) {
+                const first = list.find((n) => n.path === "index.md") ?? list[0];
+                if (first) await openNote(first.path);
+                else { setActive(null); setContent(""); }
+            }
+        } catch (err) {
+            setStatus({ kind: "err", text: `delete failed: ${err.message}` });
+        }
+    };
+
     const navigate = async (path) => {
         if (notes.some((n) => n.path === path)) await openNote(path);
         else setStatus({ kind: "err", text: `no such note: ${path}` });
     };
 
     const activeTitle = notes.find((n) => n.path === active)?.title ?? active;
-    const tree = useMemo(() => buildTree(notes), [notes]);
     const backlinks = useMemo(() => buildBacklinks(notes), [notes]);
     const activeBacklinks = (backlinks.get(active) ?? []).map((p) => ({
         path: p,
@@ -387,32 +463,31 @@ export default function App({ address, onLogout }) {
                     onCreate={createRepo}
                     onFollow={followRepo}
                 />
-                <nav className="note-list">
-                    {tree.root && (
-                        <TreeNode
-                            path={tree.root}
+                <nav
+                    className="note-list"
+                    onDragOver={(e) => repo?.writable && e.preventDefault()}
+                    onDrop={(e) => {
+                        // Dropped on empty space → move to the end of the top level.
+                        const drag = e.dataTransfer.getData("text/path");
+                        const last = tree[tree.length - 1];
+                        if (drag && last && drag !== last.path) moveNote(drag, last.path, "after");
+                    }}
+                >
+                    {tree.map((node) => (
+                        <TreeRow
+                            key={node.path}
+                            node={node}
                             depth={0}
-                            tree={tree}
                             notes={notes}
                             active={active}
+                            writable={!!repo?.writable}
                             onOpen={openNote}
+                            onMove={moveNote}
+                            onRename={renameNoteAt}
+                            onDelete={deleteNoteAt}
                         />
-                    )}
-                    {tree.orphans.length > 0 && (
-                        <>
-                            <div className="tree-section">unlinked</div>
-                            {tree.orphans.map((path) => (
-                                <button
-                                    key={path}
-                                    className={`note-item orphan ${path === active ? "active" : ""}`}
-                                    onClick={() => openNote(path)}
-                                    title={path}
-                                >
-                                    {notes.find((n) => n.path === path)?.title ?? path}
-                                </button>
-                            ))}
-                        </>
-                    )}
+                    ))}
+                    {tree.length === 0 && <div className="tree-section">no notes yet</div>}
                 </nav>
                 {repo && (
                     <footer className="repo-info">

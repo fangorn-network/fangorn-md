@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import {
-    readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, watch,
+    readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, watch, rmSync, renameSync,
 } from "node:fs";
 import { join, extname, normalize } from "node:path";
 import { Fangorn, FangornConfig, extractMarkdownLinks } from "@fangorn-network/sdk";
@@ -117,6 +117,47 @@ function userStore(address) {
 const docsDir = (repo) => join(DATA_DIR, repo.dir);
 const publicRepo = (repo, address) => ({ ...repo, writable: repo.owner === address });
 
+// ─── Explicit page tree ───────────────────────────────────────────────────────
+//
+// The sidebar hierarchy is stored, not inferred: `.tree.json` inside the repo
+// dir holds an ordered, nested [{path, children:[…]}] structure. Drag-and-drop
+// rewrites it (PUT /api/tree); Publish derives the graph's edges from it (parent
+// → child). It rides the dir scan like any note, so it publishes and pulls for
+// free — followers get the exact hierarchy. Markdown [[links]] are navigation
+// only now and no longer define structure.
+
+const TREE_FILE = ".tree.json";
+const treePath = (repo) => join(docsDir(repo), TREE_FILE);
+
+// Read the stored tree, reconciled against the .md files actually on disk: drop
+// nodes whose file is gone (or duplicated), append new files as unfiled roots.
+// Returns { tree, childrenByPath } without writing — callers persist explicitly.
+function reconcileTree(repo) {
+    const dir = docsDir(repo);
+    const files = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".md")) : [];
+    const present = new Set(files);
+    let stored = [];
+    try { stored = existsSync(treePath(repo)) ? JSON.parse(readFileSync(treePath(repo), "utf-8")) : []; } catch { stored = []; }
+
+    const seen = new Set();
+    const prune = (nodes) =>
+        (Array.isArray(nodes) ? nodes : [])
+            .filter((n) => n && present.has(n.path) && !seen.has(n.path))
+            .map((n) => { seen.add(n.path); return { path: n.path, children: prune(n.children) }; });
+    const tree = prune(stored);
+    for (const f of files) if (!seen.has(f)) tree.push({ path: f, children: [] });
+
+    const childrenByPath = new Map();
+    const walk = (nodes) => { for (const n of nodes) { childrenByPath.set(n.path, n.children.map((c) => c.path)); walk(n.children); } };
+    walk(tree);
+    return { tree, childrenByPath };
+}
+
+const writeTree = (repo, tree) => writeFileSync(treePath(repo), JSON.stringify(tree, null, 2), "utf-8");
+// Rename a note's path everywhere it appears in the stored tree.
+const renameInTree = (tree, from, to) =>
+    tree.map((n) => ({ path: n.path === from ? to : n.path, children: renameInTree(n.children, from, to) }));
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const NOTE_PATH = /^[\w][\w .-]*\.md$/;
@@ -149,9 +190,11 @@ Welcome to your new wiki. This note is **index.md** — the root of your tree.
 
 ## Getting started
 
-- Edit here on the left; changes autosave.
-- Add notes with **+**, then link them with \`[[wikilink]]\` or
-  \`[title](note.md)\` — the sidebar tree is built from those links.
+- Just write — markdown renders as you type, and changes autosave.
+- Add pages with **+**, then **drag them in the sidebar** to nest and reorder.
+  That hierarchy is what gets published — no link-wrangling required.
+- Hover a page in the sidebar to **rename** (✎) or **delete** (✕) it.
+- \`[[wikilinks]]\` still work for cross-references — ⌘/Ctrl-click one to jump.
 - Hit **Publish** to snapshot everything to the Fangorn network (you sign one
   transaction from your own wallet — the server never holds your keys).
 - Use **Share** to hand a friend a link to follow this wiki.
@@ -293,9 +336,11 @@ const routes = {
     },
 
     // ── Notes (operate on the active repo's dir) ──
+    // Returns the notes plus the explicit page `tree`. Per-note `links` are the
+    // markdown [[wikilinks]] — kept only for backlinks/navigation, not structure.
     "GET /api/notes": async ({ address }) => {
         const repo = userStore(address).activeOrNull();
-        if (!repo) return { notes: [] };
+        if (!repo) return { notes: [], tree: [] };
         const dir = docsDir(repo);
         const paths = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".md")) : [];
         const known = new Set(paths);
@@ -304,7 +349,16 @@ const routes = {
             const links = [...new Set(extractMarkdownLinks(content).map((id) => `${id}.md`))].filter((t) => t !== path && known.has(t));
             return { path, title: firstHeading(content, path.replace(/\.md$/, "")), links };
         });
-        return { notes };
+        return { notes, tree: reconcileTree(repo).tree };
+    },
+
+    // Drag-and-drop persisted the reordered hierarchy.
+    "PUT /api/tree": async ({ address, body }) => {
+        const repo = userStore(address).active();
+        if (repo.owner !== address) throw new HttpError(403, "not your repo");
+        if (!Array.isArray(body.tree)) throw new HttpError(400, "tree array required");
+        writeTree(repo, body.tree);
+        return { tree: reconcileTree(repo).tree };
     },
 
     "GET /api/notes/:path": async ({ address, path }) => {
@@ -319,6 +373,32 @@ const routes = {
         if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
         writeFileSync(join(dir, path), body.content, "utf-8");
         return { path, saved: true };
+    },
+
+    "DELETE /api/notes/:path": async ({ address, path }) => {
+        const repo = userStore(address).active();
+        if (repo.owner !== address) throw new HttpError(403, "not your repo");
+        const file = join(docsDir(repo), path);
+        if (!existsSync(file)) throw new HttpError(404, `no such note: ${path}`);
+        rmSync(file);
+        writeTree(repo, reconcileTree(repo).tree); // prune the now-missing node
+        return { deleted: path };
+    },
+
+    // Rename in place: move the file and rewrite its path throughout the tree.
+    // Existing [[wikilinks]] to the old name are left as-is (navigation only).
+    "POST /api/notes/:path/rename": async ({ address, path, body }) => {
+        const repo = userStore(address).active();
+        if (repo.owner !== address) throw new HttpError(403, "not your repo");
+        let to = String(body.to ?? "").trim();
+        if (!to.endsWith(".md")) to += ".md";
+        assertNotePath(to);
+        const dir = docsDir(repo);
+        if (!existsSync(join(dir, path))) throw new HttpError(404, `no such note: ${path}`);
+        if (existsSync(join(dir, to))) throw new HttpError(409, `already exists: ${to}`);
+        renameSync(join(dir, path), join(dir, to));
+        writeTree(repo, renameInTree(reconcileTree(repo).tree, path, to));
+        return { path: to };
     },
 
     "GET /api/remote": async ({ address }) => {
@@ -340,7 +420,7 @@ const routes = {
         const written = [];
         const skippedEncrypted = [];
         for (const [path, v] of latest) {
-            assertNotePath(path);
+            if (path !== TREE_FILE) assertNotePath(path); // the tree manifest rides along too
             // Encrypted notes only decrypt in the owner's browser — the server
             // must never overwrite local plaintext with the "🔒" placeholder.
             if (v.payload.enc !== undefined) { skippedEncrypted.push(path); continue; }
@@ -363,7 +443,11 @@ const routes = {
         const oldRoot = await readNamespaceHead(address);
         const parent = oldRoot === ZERO_BYTES32 ? undefined : fangorn.engine.commitCidFromRootHex(oldRoot);
         const { latest } = await remoteState(repo);
-        const graph = buildWikiGraph(docsDir(repo), latest);
+        // Persist the reconciled tree so it publishes as a vertex (exact
+        // hierarchy for followers), and derive the graph's edges from it.
+        const { tree, childrenByPath } = reconcileTree(repo);
+        writeTree(repo, tree);
+        const graph = buildWikiGraph(docsDir(repo), latest, childrenByPath);
         if (graph.vertices.length === 0) throw new HttpError(400, `${repo.dir}/ has no markdown files`);
 
         // Private repo: the browser sealed each note (content → hex `enc`) with a
@@ -375,6 +459,7 @@ const routes = {
         if (repo.visibility === "private") {
             const sealed = body.sealed ?? {};
             for (const v of graph.vertices) {
+                if (v.payload.path === TREE_FILE) continue; // structure vertex stays clear
                 const enc = sealed[v.payload.path];
                 if (!enc) throw new HttpError(400, `missing sealed content for ${v.payload.path} — is the wallet unlocked?`);
                 const { content, ...rest } = v.payload; // rest: {path, updatedAt}
@@ -394,13 +479,28 @@ const routes = {
         // fee — quote fees ourselves with headroom. maxFeePerGas is only a
         // ceiling (you pay baseFee+priority), so 2× is safe, not overpaying.
         const { maxFeePerGas, maxPriorityFeePerGas } = await publicClient.estimateFeesPerGas();
+        // Estimate the gas limit here too, so the wallet never has to run its own
+        // eth_estimateGas — that call against the public Arbitrum Sepolia RPC is
+        // what surfaces as "Network fee Unavailable" in MetaMask. Simulating here
+        // also turns a would-be revert (e.g. a stale root) into a clear error
+        // instead of a cryptic wallet message. 1.5× headroom; gas is only a
+        // ceiling, so overshooting costs nothing. Fallback keeps publish working
+        // if the RPC hiccups on this one call.
+        let gas;
+        try {
+            const estimate = await publicClient.estimateGas({ account: address, to: REGISTRY, data });
+            gas = (estimate * 3n) / 2n;
+        } catch (err) {
+            if (/revert/i.test(err.message)) throw new HttpError(409, `settlement would revert (root moved on-chain?) — pull and retry: ${err.shortMessage ?? err.message}`);
+            gas = 5_000_000n; // RPC hiccup, not a revert — proceed with a safe ceiling
+        }
         console.log(`[prepare:${cacheKey(repo)}] commit+flush ${((Date.now() - t0) / 1000).toFixed(1)}s → ${commit.commitCid}`);
         return {
             namespace: repo.namespace,
             commitCid: commit.commitCid,
             staged: { vertices: graph.vertices.length, edges: graph.edges.length },
             tx: {
-                to: REGISTRY, data, chainId: CHAIN.id,
+                to: REGISTRY, data, chainId: CHAIN.id, gas: toHex(gas),
                 maxFeePerGas: toHex(maxFeePerGas * 2n),
                 maxPriorityFeePerGas: toHex(maxPriorityFeePerGas),
             },
@@ -452,8 +552,12 @@ const server = createServer(async (req, res) => {
 
     let key = `${req.method} ${url.pathname}`;
     const params = {};
+    const renameMatch = url.pathname.match(/^\/api\/notes\/(.+)\/rename$/);
     const noteMatch = url.pathname.match(/^\/api\/notes\/(.+)$/);
-    if (noteMatch) {
+    if (renameMatch) {
+        params.path = decodeURIComponent(renameMatch[1]);
+        key = `${req.method} /api/notes/:path/rename`;
+    } else if (noteMatch) {
         params.path = decodeURIComponent(noteMatch[1]);
         key = `${req.method} /api/notes/:path`;
     }
