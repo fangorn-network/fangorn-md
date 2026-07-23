@@ -1,0 +1,18 @@
+# Free public HTTPS via a Cloudflare Tunnel — no ports opened on your router.
+#
+#   docker compose -f docker-compose.yml -f compose.tunnel.yml up -d --build
+#
+# Needs a domain on Cloudflare and a tunnel token from the Zero Trust dashboard
+# (Networks → Tunnels → Create). In the tunnel's Public Hostname, point your
+# hostname (e.g. wiki.example.com) at  http://fangornmd:8787  — cloudflared
+# shares this compose network, so it resolves the app by service name.
+# WebSockets (/yjs) and SSE (/api/events) pass through automatically.
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - fangornmd

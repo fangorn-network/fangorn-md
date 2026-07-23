@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api } from "./api.js";
+import { usePrivy, useWallets, useSignMessage } from "@privy-io/react-auth";
+import { api, setTokenGetter, setAddress } from "./api.js";
+import { deriveSecret, sealContent } from "./crypto.js";
 import { useEvents } from "./useEvents.js";
 import { buildTree, buildBacklinks } from "./structure.js";
-import Editor from "./Editor.jsx";
+import Editor, { CollabEditor } from "./Editor.jsx";
 
 const short = (s) => (s ? `${s.slice(0, 8)}…${s.slice(-6)}` : "");
 
@@ -103,7 +105,37 @@ function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow }) {
     );
 }
 
-export default function App() {
+export default function App({ address, onLogout }) {
+    const { getAccessToken } = usePrivy();
+    const { wallets } = useWallets();
+    const { signMessage } = useSignMessage();
+
+    // Send a tx from the user's embedded wallet, explicitly resolved (don't rely
+    // on Privy's implicit default-wallet pick). Returns the tx hash.
+    const sendFromWallet = useCallback(async (tx) => {
+        const wallet =
+            wallets.find((w) => w.address?.toLowerCase() === address?.toLowerCase()) ??
+            wallets.find((w) => w.walletClientType === "privy") ??
+            wallets[0];
+        if (!wallet) throw new Error("no wallet available — is Privy still loading?");
+        await wallet.switchChain(tx.chainId);
+        const provider = await wallet.getEthereumProvider();
+        const params = { from: wallet.address, to: tx.to, data: tx.data };
+        // Explicit fees from the server (the wallet's own estimate runs too low).
+        if (tx.maxFeePerGas) params.maxFeePerGas = tx.maxFeePerGas;
+        if (tx.maxPriorityFeePerGas) params.maxPriorityFeePerGas = tx.maxPriorityFeePerGas;
+        return provider.request({ method: "eth_sendTransaction", params: [params] });
+    }, [wallets, address]);
+    // Adapter: crypto.deriveSecret wants an async (msg) → hex-signature fn.
+    const signForKey = useCallback(async (msg) => {
+        const r = await signMessage({ message: msg });
+        return r?.signature ?? r;
+    }, [signMessage]);
+    // Wire identity into the api layer before any effect fires (this component
+    // only mounts once authenticated, so it's always valid here).
+    setTokenGetter(getAccessToken);
+    setAddress(address);
+
     const [repos, setRepos] = useState([]); // all tracked repos
     const [repo, setRepo] = useState(null); // the active one
     const [notes, setNotes] = useState([]);
@@ -112,6 +144,12 @@ export default function App() {
     const [saveState, setSaveState] = useState("saved"); // saved | unsaved | saving
     const [nudges, setNudges] = useState({}); // namespace → last on-chain NamespaceChange
     const [status, setStatus] = useState(null); // { kind: ok|err|busy, text, tx? }
+    // An incoming share link (?owner=&ns=&note=) — parsed once on mount.
+    const [share, setShare] = useState(() => {
+        const p = new URLSearchParams(window.location.search);
+        const owner = p.get("owner"), ns = p.get("ns");
+        return owner && ns ? { owner, ns, note: p.get("note") } : null;
+    });
     const saveTimer = useRef(null);
     const dirtyRef = useRef(false);
     dirtyRef.current = saveState !== "saved";
@@ -179,7 +217,7 @@ export default function App() {
         // files — just record the nudge, keyed by namespace.
         onRemoteChange: (change) =>
             setNudges((n) => ({ ...n, [change.namespace]: change })),
-    });
+    }, { getToken: getAccessToken, address });
 
     const switchRepo = async (namespace) => {
         if (namespace === repo?.namespace) return;
@@ -192,11 +230,11 @@ export default function App() {
     };
 
     const createRepo = async (namespace, visibility) => {
-        setStatus({ kind: "busy", text: `initializing ${namespace} on-chain…` });
+        setStatus({ kind: "busy", text: `creating ${namespace}…` });
         try {
             await api.createRepo(namespace, visibility);
             await loadActive();
-            setStatus({ kind: "ok", text: `created ${namespace} (${visibility})` });
+            setStatus({ kind: "ok", text: `created ${namespace} (${visibility}) — Publish to settle it on-chain` });
         } catch (err) {
             setStatus({ kind: "err", text: `create failed: ${err.message}` });
         }
@@ -225,17 +263,78 @@ export default function App() {
         }
     };
 
+    // Sharing (public repos): copy a link that lets a friend follow this repo.
+    // The repo is already public on-chain — the link just carries (owner, ns) so
+    // their app can clone it; ?note focuses one page on open.
+    const shareLink = () => {
+        if (!repo) return;
+        const url = new URL(window.location.origin + window.location.pathname);
+        url.searchParams.set("owner", repo.owner);
+        url.searchParams.set("ns", repo.namespace);
+        if (active) url.searchParams.set("note", active);
+        navigator.clipboard?.writeText(url.toString());
+        setStatus({
+            kind: "ok",
+            text: repo.head ? "share link copied — send it to a friend" : "link copied — Publish first so your friend sees anything",
+        });
+    };
+
+    const cleanShareUrl = () => window.history.replaceState({}, "", window.location.pathname);
+
+    // Accept an incoming share: follow (idempotent), pull, open the shared note.
+    const acceptShare = async () => {
+        const { owner, ns, note } = share;
+        setStatus({ kind: "busy", text: `opening shared ${ns}…` });
+        try {
+            try { await api.followRepo(owner, ns); }
+            catch (e) { if (!/already tracking/i.test(e.message)) throw e; }
+            await api.setActiveRepo(ns);
+            await api.pull();
+            await loadActive();
+            if (note) await openNote(note).catch(() => {});
+            setStatus({ kind: "ok", text: `following ${ns} (read-only)` });
+        } catch (err) {
+            setStatus({ kind: "err", text: `couldn't open share: ${err.message}` });
+        } finally {
+            setShare(null);
+            cleanShareUrl();
+        }
+    };
+
     const publish = async () => {
         const message = window.prompt("Commit message", "update wiki");
         if (message === null) return;
-        setStatus({ kind: "busy", text: "publishing — committing and settling on-chain…" });
         try {
             const started = Date.now();
-            const r = await api.publish(message);
+
+            // Private repo: seal every note in the browser so the server only
+            // ever receives ciphertext it can't read.
+            let sealed;
+            if (repo?.visibility === "private") {
+                setStatus({ kind: "busy", text: "unlocking your encryption key…" });
+                const secret = await deriveSecret(signForKey);
+                setStatus({ kind: "busy", text: "encrypting notes…" });
+                sealed = {};
+                for (const n of notes) {
+                    const { content } = await api.note(n.path);
+                    sealed[n.path] = sealContent(repo.namespace, n.path, content, secret);
+                }
+            }
+
+            setStatus({ kind: "busy", text: "preparing commit…" });
+            const { namespace, commitCid, staged, tx } = await api.publishPrepare(message, sealed);
+
+            // The server built the commit but holds no key: WE sign the one
+            // settlement tx with our own wallet.
+            setStatus({ kind: "busy", text: "approve the transaction in your wallet…" });
+            const txHash = await sendFromWallet(tx);
+
+            setStatus({ kind: "busy", text: "recording the new head…" });
+            await api.settle(namespace, commitCid, txHash);
             setStatus({
                 kind: "ok",
-                text: `published ${r.visibility} commit ${short(r.commitCid)} (${r.staged.vertices} notes, ${r.staged.edges} links) in ${((Date.now() - started) / 1000).toFixed(1)}s`,
-                tx: r.txHash,
+                text: `published ${short(commitCid)} (${staged.vertices} notes, ${staged.edges} links) in ${((Date.now() - started) / 1000).toFixed(1)}s`,
+                tx: txHash,
             });
         } catch (err) {
             setStatus({ kind: "err", text: `publish failed: ${err.message}` });
@@ -275,6 +374,10 @@ export default function App() {
                 <div className="sidebar-head">
                     <span className="brand">🌲 fangornmd</span>
                     <button className="btn small" onClick={newNote} title="New note">＋</button>
+                </div>
+                <div className="account-bar" title={address}>
+                    <span className="account-addr">{address ? short(address) : "no wallet"}</span>
+                    <button className="btn ghost small" onClick={onLogout} title="Log out">log out</button>
                 </div>
                 <RepoBar
                     repos={repos}
@@ -321,6 +424,14 @@ export default function App() {
             </aside>
 
             <main className="main">
+                {share && (
+                    <div className="banner">
+                        🔗 A wiki was shared with you — <b>{share.ns}</b> by {short(share.owner)}
+                        {share.note ? ` · ${share.note}` : ""}.
+                        <button className="btn" onClick={acceptShare} disabled={status?.kind === "busy"}>Follow &amp; open</button>
+                        <button className="btn ghost" onClick={() => { setShare(null); cleanShareUrl(); }}>Dismiss</button>
+                    </div>
+                )}
                 {activeNudge && (
                     <div className="banner">
                         <b>{repo.namespace}</b> updated on-chain (block {activeNudge.blockNumber},{" "}
@@ -333,6 +444,11 @@ export default function App() {
                     <span className="doc-title">{activeTitle ?? "—"}</span>
                     <span className={`save-state ${saveState}`}>{saveState}</span>
                     <span className="spacer" />
+                    {repo && repo.visibility !== "private" && (
+                        <button className="btn" onClick={shareLink} title="Copy a link so a friend can follow this wiki">
+                            Share
+                        </button>
+                    )}
                     {repo?.writable && (
                         <button className="btn primary" onClick={publish} disabled={status?.kind === "busy"}>
                             Publish
@@ -352,7 +468,22 @@ export default function App() {
                 )}
                 {active ? (
                     <>
-                        <Editor content={content} onChange={onChange} onNavigate={navigate} />
+                        {repo && repo.visibility === "public" ? (
+                            <CollabEditor
+                                key={`${repo.owner}:${repo.namespace}:${active}`}
+                                owner={repo.owner}
+                                namespace={repo.namespace}
+                                note={active}
+                                content={content}
+                                onChange={onChange}
+                                onNavigate={navigate}
+                                address={address}
+                                getToken={getAccessToken}
+                                writable={repo.writable}
+                            />
+                        ) : (
+                            <Editor content={content} onChange={onChange} onNavigate={navigate} noteKey={active} />
+                        )}
                         {activeBacklinks.length > 0 && (
                             <footer className="backlinks">
                                 linked from:

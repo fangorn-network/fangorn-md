@@ -17,11 +17,22 @@
   "packageManager": "pnpm@10.30.1",
   "dependencies": {
     "@fangorn-network/sdk": "2026.7.1-4.0",
+    "@privy-io/react-auth": "^3.35.1",
+    "@slate-yjs/core": "^1.0.2",
+    "@y/websocket-server": "^0.1.5",
     "dompurify": "^3.4.12",
+    "jose": "^6.2.3",
     "marked": "^18.0.6",
+    "multiformats": "^14.0.4",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
-    "viem": "^2.55.1"
+    "slate": "^0.126.0",
+    "slate-history": "^0.113.1",
+    "slate-react": "^0.126.0",
+    "viem": "^2.55.1",
+    "ws": "^8.21.1",
+    "y-websocket": "^3.0.0",
+    "yjs": "^13.6.31"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^6.0.3",

@@ -160,14 +160,33 @@ body {
 .status a { color: inherit; }
 
 /* ── Split editor ────────────────────────────────────── */
+.collab { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.presence-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-panel);
+    font-size: 12px;
+}
+.presence-label { color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; font-size: 10px; }
+.presence-chip {
+    color: #fff;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font: 11px/1.6 ui-monospace, monospace;
+}
 .editor { flex: 1; display: flex; min-height: 0; }
 .editor-input {
     width: 50%;
     padding: 20px;
     border: 0;
     border-right: 1px solid var(--border);
-    resize: none;
     outline: none;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
     background: var(--bg-input);
     color: var(--text);
     font: 14px/1.7 ui-monospace, "Cascadia Code", Menlo, monospace;
@@ -218,3 +237,11 @@ body {
 .btn.primary:disabled { opacity: 0.5; cursor: default; }
 .btn.ghost { border: 0; background: none; color: var(--text-dim); }
 .btn.small { padding: 2px 9px; }
+
+/* ── Login gate + account bar ─────────────────────────────────────────── */
+.gate { display: flex; align-items: center; justify-content: center; height: 100vh; background: var(--bg); }
+.gate-card { text-align: center; padding: 40px 44px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px; max-width: 380px; }
+.gate-card h1 { margin: 0 0 12px; font-size: 24px; }
+.gate-card p { color: var(--text-dim); margin: 0 0 22px; line-height: 1.5; }
+.account-bar { display: flex; align-items: center; justify-content: space-between; padding: 6px 12px; border-bottom: 1px solid var(--border); font-size: 12px; }
+.account-addr { color: var(--text-dim); font-family: ui-monospace, monospace; }

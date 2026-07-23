@@ -4,7 +4,12 @@
 # via the CLI first, or bring the stack up and create one from the UI.
 services:
   fangornmd:
-    build: .
+    build:
+      context: .
+      args:
+        # Inlined into the browser bundle at build time (public value; the
+        # server also reads it at runtime via env_file). Interpolated from .env.
+        VITE_PRIVY_APP_ID: ${VITE_PRIVY_APP_ID}
     ports:
       - "8787:8787"
     env_file: .env

@@ -15,6 +15,11 @@ COPY src ./src
 COPY server ./server
 
 # Build the frontend into dist/ (vite lives in the copied node_modules).
+# VITE_* vars are inlined into the bundle at BUILD time, so the Privy app id
+# must be present here — runtime env_file is too late for the browser. It's a
+# public value (also shipped to the client), so baking it in is fine.
+ARG VITE_PRIVY_APP_ID
+ENV VITE_PRIVY_APP_ID=$VITE_PRIVY_APP_ID
 RUN node_modules/.bin/vite build
 
 ENV PORT=8787

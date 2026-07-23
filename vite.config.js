@@ -12,6 +12,12 @@ export default defineConfig({
                 target: "http://localhost:8787",
                 changeOrigin: true,
             },
+            // Yjs live-collab relay (see server/index.js) — needs WS upgrades.
+            "/yjs": {
+                target: "ws://localhost:8787",
+                ws: true,
+                changeOrigin: true,
+            },
         },
     },
 });

@@ -1,5 +1,23 @@
-// Thin client for the local fangornmd server (see server/index.js). The Vite
-// dev server proxies /api to it, so the browser sees a single origin.
+// Thin client for the fangornmd server (see server/index.js). The Vite dev
+// server proxies /api to it, so the browser sees a single origin.
+//
+// Every request carries the Privy access token (set once at login via
+// setTokenGetter) so the server can identify the caller. The token getter is
+// injected rather than imported to keep this module free of React.
+
+let tokenGetter = null;
+let walletAddress = null;
+export const setTokenGetter = (fn) => { tokenGetter = fn; };
+export const setAddress = (addr) => { walletAddress = addr; };
+
+async function authHeaders(extra) {
+    const token = tokenGetter ? await tokenGetter() : null;
+    return {
+        ...extra,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(walletAddress ? { "X-Wallet-Address": walletAddress } : {}),
+    };
+}
 
 async function json(res) {
     const body = await res.json();
@@ -7,29 +25,34 @@ async function json(res) {
     return body;
 }
 
-const post = (url, body) =>
+const get = async (url) => fetch(url, { headers: await authHeaders() }).then(json);
+
+const post = async (url, body) =>
     fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: await authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(body ?? {}),
     }).then(json);
 
 export const api = {
-    repo: () => fetch("/api/repo").then(json),
-    repos: () => fetch("/api/repos").then(json),
+    repo: () => get("/api/repo"),
+    repos: () => get("/api/repos"),
     createRepo: (namespace, visibility) => post("/api/repos", { namespace, visibility }),
     followRepo: (owner, namespace) => post("/api/repos/follow", { owner, namespace }),
     setActiveRepo: (namespace) => post("/api/repos/active", { namespace }),
-    notes: () => fetch("/api/notes").then(json),
-    note: (path) => fetch(`/api/notes/${encodeURIComponent(path)}`).then(json),
-    save: (path, content) =>
+    notes: () => get("/api/notes"),
+    note: (path) => get(`/api/notes/${encodeURIComponent(path)}`),
+    save: async (path, content) =>
         fetch(`/api/notes/${encodeURIComponent(path)}`, {
             method: "PUT",
-            headers: { "Content-Type": "application/json" },
+            headers: await authHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify({ content }),
         }).then(json),
-    remote: () => fetch("/api/remote").then(json),
-    history: () => fetch("/api/history").then(json),
+    remote: () => get("/api/remote"),
+    history: () => get("/api/history"),
     pull: () => post("/api/pull"),
-    publish: (message) => post("/api/publish", { message }),
+    // Self-custodial publish: server builds the commit (keyless) and returns the
+    // unsigned settlement tx; the browser signs+sends it, then reports back.
+    publishPrepare: (message, sealed) => post("/api/publish/prepare", { message, sealed }),
+    settle: (namespace, commitCid, txHash) => post("/api/settle", { namespace, commitCid, txHash }),
 };

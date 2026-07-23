@@ -1,19 +1,33 @@
 import { createServer } from "node:http";
 import {
-    readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, renameSync, watch,
+    readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, watch,
 } from "node:fs";
 import { join, extname, normalize } from "node:path";
 import { Fangorn, FangornConfig, extractMarkdownLinks } from "@fangorn-network/sdk";
+import { createPublicClient, http, encodeFunctionData, toHex } from "viem";
+import { CID } from "multiformats/cid";
+import { createRemoteJWKSet, jwtVerify } from "jose";
+import { WebSocketServer } from "ws";
+import { setupWSConnection } from "@y/websocket-server/utils";
 import { buildWikiGraph, latestByPath, latestEdges } from "./graph.js";
-import { sealContent, unsealContent } from "./crypto.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
+//
+// This server is now a MULTI-TENANT RELAY, not a wallet. It holds NO user key.
+// Each user is a Privy wallet address (asserted per-request, proven on-chain at
+// settle time). The server's own ETH_PRIVATE_KEY is a SERVICE key used only to
+// construct the keyless engine (reads, graph build, IPFS pinning) — it never
+// signs a user's on-chain settlement. That single tx is sent by the user's
+// browser wallet; see /api/publish/prepare + /api/settle below.
 
 const PORT = Number(process.env.PORT ?? 8787);
 const ROOT = process.cwd();
-const DOCS_ROOT = join(ROOT, "docs");
-const REPOS_PATH = join(ROOT, ".fangorn", "repos.json");
-const LEGACY_PATH = join(ROOT, ".fangorn", "repo.json");
+// Persistent state (working trees + repo store) lives under DATA_DIR so a deploy
+// can put it on one mounted volume; defaults to cwd for local/dev. The built SPA
+// (dist/) stays under ROOT — it ships in the image, not the volume.
+const DATA_DIR = process.env.DATA_DIR ?? ROOT;
+const USERS_DIR = join(DATA_DIR, ".fangorn", "users");
+const PRIVY_APP_ID = process.env.PRIVY_APP_ID ?? process.env.VITE_PRIVY_APP_ID;
 
 for (const key of ["ETH_PRIVATE_KEY", "PINATA_JWT", "PINATA_GATEWAY"]) {
     if (!process.env[key]) {
@@ -21,123 +35,94 @@ for (const key of ["ETH_PRIVATE_KEY", "PINATA_JWT", "PINATA_GATEWAY"]) {
         process.exit(1);
     }
 }
+if (!PRIVY_APP_ID) {
+    console.error("Missing VITE_PRIVY_APP_ID — needed to verify Privy login tokens.");
+    process.exit(1);
+}
 
 const fangorn = Fangorn.create({
-    privateKey: process.env.ETH_PRIVATE_KEY,
-    storage: {
-        pinata: {
-            jwt: process.env.PINATA_JWT,
-            gateway: process.env.PINATA_GATEWAY,
-        },
-    },
+    privateKey: process.env.ETH_PRIVATE_KEY, // service key: engine construction + Pinata only
+    storage: { pinata: { jwt: process.env.PINATA_JWT, gateway: process.env.PINATA_GATEWAY } },
     domain: "localhost",
     config: FangornConfig,
 });
 
-// ─── Repo store ─────────────────────────────────────────────────────────────
+// Direct chain reads (current root) + the one tx the browser will sign.
+const REGISTRY = FangornConfig.dataRegistryContractAddress;
+const CHAIN = FangornConfig.chain;
+const ZERO_BYTES32 = `0x${"0".repeat(64)}`;
+const publicClient = createPublicClient({ chain: CHAIN, transport: http(FangornConfig.rpcUrl) });
+const REGISTRY_ABI = [
+    { type: "function", name: "getNamespaceHead", stateMutability: "view", inputs: [{ name: "publisher", type: "address" }], outputs: [{ type: "bytes32" }] },
+    { type: "function", name: "commitStateRoot", stateMutability: "nonpayable", inputs: [{ name: "old_root", type: "bytes32" }, { name: "new_root", type: "bytes32" }], outputs: [] },
+];
+
+const readNamespaceHead = (owner) =>
+    publicClient.readContract({ address: REGISTRY, abi: REGISTRY_ABI, functionName: "getNamespaceHead", args: [owner] });
+// The on-chain root hex is exactly the commit CID's multihash digest (see the
+// SDK's pushCommit) — so a settlement tx is commitStateRoot(currentRoot, newRoot).
+const rootHexFromCid = (cid) => `0x${Buffer.from(CID.parse(cid).multihash.digest).toString("hex")}`;
+
+// ─── Auth (Privy) ───────────────────────────────────────────────────────────
 //
-// One publisher's on-chain root spans ALL its namespaces, so this app can track
-// several Fangorn repos at once. `.fangorn/repos.json` is the analogue of a
-// multi-remote `.git/config` + HEAD: for each namespace we remember whose root
-// it belongs to, its local tip commit, whether we encrypt it (private), and
-// which subfolder holds its working tree. Repos owned by other addresses are
-// read-only follows — reading and subscribing need no permission from anyone.
+// The access token proves a live Privy session (gates the service). The wallet
+// ADDRESS is asserted by the client — that's safe because it's the settlement
+// tx, signed by the actual wallet, that authenticates a publish on-chain: you
+// can build/stage under any address, but you can only SETTLE from the wallet you
+// hold. (Binding address→DID server-side would need the Privy app secret + API;
+// tracked as a hardening step.)
 
-const relDir = (namespace) => `docs/${namespace}`;
+const JWKS = createRemoteJWKSet(new URL(`https://auth.privy.io/api/v1/apps/${PRIVY_APP_ID}/jwks.json`));
 
-function migrateLegacy() {
-    // First boot after the multi-repo upgrade: wrap the single repo.json into
-    // repos.json and move its flat docs/*.md into docs/<namespace>/.
-    const legacy = JSON.parse(readFileSync(LEGACY_PATH, "utf-8"));
-    const ns = legacy.namespace;
-    const dir = relDir(ns);
-    const abs = join(ROOT, dir);
-    if (!existsSync(abs)) {
-        mkdirSync(abs, { recursive: true });
-        for (const f of readdirSync(DOCS_ROOT).filter((f) => f.endsWith(".md"))) {
-            renameSync(join(DOCS_ROOT, f), join(abs, f));
-        }
+class HttpError extends Error {
+    constructor(status, message) { super(message); this.status = status; }
+}
+
+async function authenticate(token, assertedAddress) {
+    if (!token) throw new HttpError(401, "missing auth token");
+    try {
+        await jwtVerify(token, JWKS, { issuer: "privy.io", audience: PRIVY_APP_ID });
+    } catch {
+        throw new HttpError(401, "invalid auth token");
     }
-    const store = {
-        active: ns,
-        repos: {
-            [ns]: { namespace: ns, owner: legacy.owner, head: legacy.head ?? null, visibility: "public", dir },
-        },
+    const address = String(assertedAddress ?? "").toLowerCase();
+    if (!/^0x[0-9a-f]{40}$/.test(address)) throw new HttpError(400, "missing or invalid X-Wallet-Address");
+    return address;
+}
+
+// ─── Per-user repo store ────────────────────────────────────────────────────
+//
+// One file per user at .fangorn/users/<address>.json — no shared mutable state
+// between users. Same shape as the old repos.json: { active, repos: { ns → … } }.
+// A repo is (owner, namespace); repos the user owns are writable, follows aren't.
+
+const relDir = (address, namespace) => `docs/${address}/${namespace}`;
+
+function userStore(address) {
+    const file = join(USERS_DIR, `${address}.json`);
+    const read = () => (existsSync(file) ? JSON.parse(readFileSync(file, "utf-8")) : { active: null, repos: {} });
+    const write = (s) => writeFileSync(file, JSON.stringify(s, null, 2), "utf-8");
+    return {
+        read,
+        list: () => Object.values(read().repos),
+        get(ns) { const r = read().repos[ns]; if (!r) throw new HttpError(404, `no such repo: ${ns}`); return r; },
+        activeOrNull() { const s = read(); return s.active ? s.repos[s.active] : null; },
+        active() { const r = this.activeOrNull(); if (!r) throw new HttpError(404, "no active repo — create one first"); return r; },
+        setActive(ns) { const s = read(); if (!s.repos[ns]) throw new HttpError(404, `no such repo: ${ns}`); s.active = ns; write(s); },
+        setHead(ns, cid) { const s = read(); s.repos[ns].head = cid; write(s); },
+        add(repo) { const s = read(); s.repos[repo.namespace] = repo; s.active = repo.namespace; write(s); },
     };
-    writeFileSync(REPOS_PATH, JSON.stringify(store, null, 2), "utf-8");
-    console.log(`[migrate] repo.json → repos.json; moved docs/*.md into ${dir}/`);
 }
 
-if (!existsSync(REPOS_PATH)) {
-    if (existsSync(LEGACY_PATH)) migrateLegacy();
-    else {
-        console.error(
-            "No .fangorn/repos.json here. Run `pnpm exec fangorn repo init <namespace>` " +
-            "then start again, or create a repo from the UI once the server is up.",
-        );
-        process.exit(1);
-    }
-}
-
-const store = {
-    read: () => JSON.parse(readFileSync(REPOS_PATH, "utf-8")),
-    write(next) {
-        writeFileSync(REPOS_PATH, JSON.stringify(next, null, 2), "utf-8");
-    },
-    list() {
-        return Object.values(this.read().repos);
-    },
-    get(namespace) {
-        const repo = this.read().repos[namespace];
-        if (!repo) throw new HttpError(404, `no such repo: ${namespace}`);
-        return repo;
-    },
-    active() {
-        const s = this.read();
-        return this.get(s.active);
-    },
-    setActive(namespace) {
-        const s = this.read();
-        this.get(namespace); // existence check
-        s.active = namespace;
-        this.write(s);
-    },
-    setHead(namespace, cid) {
-        const s = this.read();
-        s.repos[namespace].head = cid;
-        this.write(s);
-    },
-    add(repo) {
-        const s = this.read();
-        s.repos[repo.namespace] = repo;
-        s.active = repo.namespace;
-        this.write(s);
-    },
-};
-
-// We can only push to our OWN on-chain root. A repo tracking another owner is a
-// read-only follow — reads and sync still work, publish is refused.
-const writable = (repo) =>
-    repo.owner.toLowerCase() === fangorn.getAddress().toLowerCase();
-
-const docsDir = (repo) => join(ROOT, repo.dir);
-const publicRepo = (repo) => ({ ...repo, writable: writable(repo) });
+const docsDir = (repo) => join(DATA_DIR, repo.dir);
+const publicRepo = (repo, address) => ({ ...repo, writable: repo.owner === address });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// Note paths are flat filenames inside a repo dir — reject anything else.
 const NOTE_PATH = /^[\w][\w .-]*\.md$/;
-// A namespace is a single on-chain key segment: keep it filesystem-safe.
 const NAMESPACE = /^[\w][\w.-]{0,63}$/;
 function assertNotePath(path) {
     if (!NOTE_PATH.test(path)) throw new HttpError(400, `invalid note path: ${path}`);
-}
-
-class HttpError extends Error {
-    constructor(status, message) {
-        super(message);
-        this.status = status;
-    }
 }
 
 const bigintReplacer = (_k, v) => (typeof v === "bigint" ? v.toString() : v);
@@ -151,315 +136,289 @@ function readJson(req) {
     return new Promise((resolve, reject) => {
         let data = "";
         req.on("data", (c) => (data += c));
-        req.on("end", () => {
-            try {
-                resolve(data ? JSON.parse(data) : {});
-            } catch {
-                reject(new HttpError(400, "invalid JSON body"));
-            }
-        });
+        req.on("end", () => { try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new HttpError(400, "invalid JSON body")); } });
         req.on("error", reject);
     });
 }
 
-const firstHeading = (content, fallback) =>
-    content.match(/^#\s+(.+)$/m)?.[1]?.trim() ?? fallback;
+const firstHeading = (content, fallback) => content?.match(/^#\s+(.+)$/m)?.[1]?.trim() ?? fallback;
 
-// A private repo stores `enc` (hex ciphertext) instead of `content`. Only the
-// owner can decrypt; a follower without the key sees a placeholder. Returns a
-// shallow-cloned vertex whose payload always has a usable `content`, so the
-// rest of the pipeline (latestByPath / firstHeading) stays oblivious to
-// encryption.
-function decodeVertex(repo, v) {
+const indexBoilerplate = (namespace) => `# ${namespace}
+
+Welcome to your new wiki. This note is **index.md** — the root of your tree.
+
+## Getting started
+
+- Edit here on the left; changes autosave.
+- Add notes with **+**, then link them with \`[[wikilink]]\` or
+  \`[title](note.md)\` — the sidebar tree is built from those links.
+- Hit **Publish** to snapshot everything to the Fangorn network (you sign one
+  transaction from your own wallet — the server never holds your keys).
+- Use **Share** to hand a friend a link to follow this wiki.
+
+Happy writing 🌲
+`;
+
+// The server never decrypts. A private note's payload carries `enc` (ciphertext)
+// instead of `content`; decryption is the browser's job (owner-side key). Until
+// that lands, encrypted content surfaces as a placeholder — the point is the
+// server CANNOT read it.
+function decodeVertex(v) {
     const p = v.payload ?? {};
     if (p.enc === undefined) return v;
-    let content;
-    try {
-        content = unsealContent(repo.namespace, p.path, p.enc);
-    } catch {
-        content = "🔒 (encrypted — you don't hold the key for this repo)";
-    }
-    return { ...v, payload: { ...p, content } };
+    return { ...v, payload: { ...p, content: "🔒 (encrypted — opens in the owner's browser)" } };
 }
 
-// Reading a namespace means walking the pail tree from the owner's on-chain
-// root — dozens of *sequential* IPFS-gateway fetches, and by far the slowest
-// thing this server does. The walk is fully determined by the on-chain tip, so
-// cache it per namespace keyed by that tip: one cheap RPC read per call decides
-// whether the cached walk is still current.
-const remoteCache = new Map(); // namespace → { tip, contents }
+// Reading a namespace walks the pail tree from the owner's on-chain root — many
+// sequential gateway fetches. Cache per (owner, namespace) keyed by the tip.
+const remoteCache = new Map();
+const cacheKey = (repo) => `${repo.owner}/${repo.namespace}`;
 
 async function remoteState(repo) {
     const tip = await fangorn.onChainTip(repo.owner);
-    const cached = remoteCache.get(repo.namespace);
+    const cached = remoteCache.get(cacheKey(repo));
     if (!cached || cached.tip !== tip) {
         const started = Date.now();
-        // listNamespace takes an explicit publisher, so it works for follows too.
         const raw = await fangorn.engine.listNamespace(repo.namespace, repo.owner);
-        const contents = { ...raw, vertices: raw.vertices.map((v) => decodeVertex(repo, v)) };
-        remoteCache.set(repo.namespace, { tip, contents });
-        console.log(`[remote:${repo.namespace}] walked ${contents.vertices.length} vertices / ${contents.edges.length} edges in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        const contents = { ...raw, vertices: raw.vertices.map(decodeVertex) };
+        remoteCache.set(cacheKey(repo), { tip, contents });
+        console.log(`[remote:${cacheKey(repo)}] walked ${contents.vertices.length} vertices / ${contents.edges.length} edges in ${((Date.now() - started) / 1000).toFixed(1)}s`);
     }
-    const contents = remoteCache.get(repo.namespace).contents;
+    const contents = remoteCache.get(cacheKey(repo)).contents;
     return { tip, contents, latest: latestByPath(contents) };
 }
 
 // ─── Live events (SSE) ────────────────────────────────────────────────────────
 //
-// The browser holds one EventSource on /api/events. Three things flow through:
-//   - "local-change":  a file in the ACTIVE repo's dir changed on disk
-//   - "remote-change": some tracked owner pushed a new commit on-chain, tagged
-//                      with the affected `namespace`
-//
-// The on-chain watch is a light client (polls StateCommitted, diffs pail roots,
-// no indexer). We keep one subscription PER TRACKED REPO while anyone listens.
+// EventSource can't set headers, so it passes ?token=&address= for auth. Each
+// connection watches only its own user: local-change (their working tree) and
+// remote-change (each tracked repo's on-chain updates). Repos added after
+// connect are picked up on the next reconnect.
 
-const sseClients = new Set();
-const subscriptions = new Map(); // namespace → AbortController
+async function handleEvents(req, res, url) {
+    let address;
+    try { address = await authenticate(url.searchParams.get("token"), url.searchParams.get("address")); }
+    catch { res.writeHead(401); return res.end(); }
 
-function broadcast(event, data) {
-    const frame = `event: ${event}\ndata: ${JSON.stringify(data, bigintReplacer)}\n\n`;
-    for (const res of sseClients) res.write(frame);
-}
-
-function watchRepo(repo) {
-    if (subscriptions.has(repo.namespace)) return;
-    const abort = new AbortController();
-    subscriptions.set(repo.namespace, abort);
-    const { signal } = abort;
-    (async () => {
-        try {
-            for await (const change of fangorn.subscribe({ namespace: repo.namespace, owner: repo.owner, signal })) {
-                remoteCache.delete(repo.namespace); // tip moved — re-walk on next read
-                broadcast("remote-change", { ...change, namespace: repo.namespace });
-            }
-        } catch (err) {
-            if (!signal.aborted) console.error(`subscribe(${repo.namespace}) failed:`, err.message);
-        } finally {
-            if (subscriptions.get(repo.namespace) === abort) subscriptions.delete(repo.namespace);
-        }
-    })();
-}
-
-// Ensure exactly the tracked repos are being watched (called on connect and
-// whenever the repo set changes).
-function syncSubscriptions() {
-    if (sseClients.size === 0) return;
-    for (const repo of store.list()) watchRepo(repo);
-}
-
-function stopAllSubscriptions() {
-    for (const abort of subscriptions.values()) abort.abort();
-    subscriptions.clear();
-}
-
-function handleEvents(res) {
-    res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-    });
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
     res.write("retry: 3000\n\n");
-    sseClients.add(res);
-    syncSubscriptions();
+    const write = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data, bigintReplacer)}\n\n`);
+
+    const userDir = join(DATA_DIR, "docs", address);
+    mkdirSync(userDir, { recursive: true });
+    let debounce = null;
+    const localWatcher = watch(userDir, { recursive: true }, () => {
+        clearTimeout(debounce);
+        debounce = setTimeout(() => write("local-change", {}), 200);
+    });
+
+    const aborts = [];
+    for (const repo of userStore(address).list()) {
+        const abort = new AbortController();
+        aborts.push(abort);
+        (async () => {
+            try {
+                for await (const change of fangorn.subscribe({ namespace: repo.namespace, owner: repo.owner, signal: abort.signal })) {
+                    remoteCache.delete(cacheKey(repo));
+                    write("remote-change", { ...change, namespace: repo.namespace });
+                }
+            } catch (err) {
+                if (!abort.signal.aborted) console.error(`subscribe(${cacheKey(repo)}) failed:`, err.message);
+            }
+        })();
+    }
 
     const heartbeat = setInterval(() => res.write(": ping\n\n"), 25_000);
-    res.on("close", () => {
+    req.on("close", () => {
         clearInterval(heartbeat);
-        sseClients.delete(res);
-        if (sseClients.size === 0) stopAllSubscriptions();
-    });
-}
-
-// Surface out-of-band edits to the active repo's dir (vim, git checkout, a pull
-// below...). Re-armed whenever the active repo changes.
-let docsWatcher = null;
-let watchDebounce = null;
-function watchActiveDocs() {
-    docsWatcher?.close();
-    const dir = docsDir(store.active());
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    docsWatcher = watch(dir, () => {
-        clearTimeout(watchDebounce);
-        watchDebounce = setTimeout(() => broadcast("local-change", {}), 200);
+        clearTimeout(debounce);
+        localWatcher.close();
+        for (const a of aborts) a.abort();
     });
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
+//
+// Every handler receives { address } (the authenticated caller) plus body/path.
 
 const routes = {
     // ── Repo management ──
-    "GET /api/repos": async () => {
-        const s = store.read();
-        return { active: s.active, address: fangorn.getAddress(), repos: store.list().map(publicRepo) };
+    "GET /api/repos": async ({ address }) => {
+        const s = userStore(address);
+        const state = s.read();
+        return { active: state.active, address, repos: s.list().map((r) => publicRepo(r, address)) };
     },
 
-    // The active repo, shaped like the old /api/repo response for the frontend.
-    "GET /api/repo": async () => publicRepo(store.active()),
+    "GET /api/repo": async ({ address }) => {
+        const repo = userStore(address).activeOrNull();
+        return repo ? publicRepo(repo, address) : null;
+    },
 
-    // Allocate a namespace on our own on-chain root and start tracking it.
-    "POST /api/repos": async ({ body }) => {
+    // Create a repo LOCALLY — no on-chain tx. The namespace is allocated on-chain
+    // by its first publish (which parents on the user's current root).
+    "POST /api/repos": async ({ address, body }) => {
         const namespace = String(body.namespace ?? "").trim();
         if (!NAMESPACE.test(namespace)) throw new HttpError(400, "invalid namespace");
-        if (store.read().repos[namespace]) throw new HttpError(409, `already tracking ${namespace}`);
+        const s = userStore(address);
+        if (s.read().repos[namespace]) throw new HttpError(409, `already tracking ${namespace}`);
         const visibility = body.visibility === "private" ? "private" : "public";
-
-        await fangorn.initRepo(namespace); // idempotent on-chain allocation
-        const dir = relDir(namespace);
-        const abs = join(ROOT, dir);
+        const dir = relDir(address, namespace);
+        const abs = join(DATA_DIR, dir);
         mkdirSync(abs, { recursive: true });
         const index = join(abs, "index.md");
-        if (!existsSync(index)) writeFileSync(index, `# ${namespace}\n\nWelcome to your new repo.\n`, "utf-8");
-
-        store.add({ namespace, owner: fangorn.getAddress(), head: null, visibility, dir });
-        watchActiveDocs();
-        syncSubscriptions();
-        return publicRepo(store.active());
+        if (!existsSync(index)) writeFileSync(index, indexBoilerplate(namespace), "utf-8");
+        s.add({ namespace, owner: address, head: null, visibility, dir });
+        return publicRepo(s.active(), address);
     },
 
-    // Track someone else's published namespace read-only (owner + namespace is a
-    // full address). No objects are downloaded — reads resolve from IPFS by CID.
-    "POST /api/repos/follow": async ({ body }) => {
+    // Track someone else's namespace read-only (owner + namespace).
+    "POST /api/repos/follow": async ({ address, body }) => {
         const namespace = String(body.namespace ?? "").trim();
-        const owner = String(body.owner ?? "").trim();
+        const owner = String(body.owner ?? "").trim().toLowerCase();
         if (!NAMESPACE.test(namespace)) throw new HttpError(400, "invalid namespace");
-        if (!/^0x[0-9a-fA-F]{40}$/.test(owner)) throw new HttpError(400, "invalid owner address");
-        if (store.read().repos[namespace]) throw new HttpError(409, `already tracking ${namespace}`);
-
-        const head = await fangorn.onChainTip(owner);
-        const dir = relDir(namespace);
-        mkdirSync(join(ROOT, dir), { recursive: true });
-        store.add({ namespace, owner, head, visibility: "public", dir });
-        watchActiveDocs();
-        syncSubscriptions();
-        return publicRepo(store.active());
+        if (!/^0x[0-9a-f]{40}$/.test(owner)) throw new HttpError(400, "invalid owner address");
+        const s = userStore(address);
+        if (s.read().repos[namespace]) throw new HttpError(409, `already tracking ${namespace}`);
+        const tip = await fangorn.onChainTip(owner).catch(() => null);
+        const dir = relDir(address, namespace);
+        mkdirSync(join(DATA_DIR, dir), { recursive: true });
+        s.add({ namespace, owner, head: tip ?? null, visibility: "public", dir });
+        return publicRepo(s.active(), address);
     },
 
-    "POST /api/repos/active": async ({ body }) => {
-        store.setActive(String(body.namespace ?? ""));
-        watchActiveDocs();
-        return publicRepo(store.active());
+    "POST /api/repos/active": async ({ address, body }) => {
+        const s = userStore(address);
+        s.setActive(String(body.namespace ?? ""));
+        return publicRepo(s.active(), address);
     },
 
     // ── Notes (operate on the active repo's dir) ──
-    "GET /api/notes": async () => {
-        const dir = docsDir(store.active());
+    "GET /api/notes": async ({ address }) => {
+        const repo = userStore(address).activeOrNull();
+        if (!repo) return { notes: [] };
+        const dir = docsDir(repo);
         const paths = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".md")) : [];
         const known = new Set(paths);
         const notes = paths.map((path) => {
             const content = readFileSync(join(dir, path), "utf-8");
-            const links = [...new Set(extractMarkdownLinks(content).map((id) => `${id}.md`))]
-                .filter((target) => target !== path && known.has(target));
+            const links = [...new Set(extractMarkdownLinks(content).map((id) => `${id}.md`))].filter((t) => t !== path && known.has(t));
             return { path, title: firstHeading(content, path.replace(/\.md$/, "")), links };
         });
         return { notes };
     },
 
-    "GET /api/notes/:path": async ({ path }) => {
-        const file = join(docsDir(store.active()), path);
+    "GET /api/notes/:path": async ({ address, path }) => {
+        const file = join(docsDir(userStore(address).active()), path);
         if (!existsSync(file)) throw new HttpError(404, `no such note: ${path}`);
         return { path, content: readFileSync(file, "utf-8") };
     },
 
-    "PUT /api/notes/:path": async ({ path, body }) => {
+    "PUT /api/notes/:path": async ({ address, path, body }) => {
         if (typeof body.content !== "string") throw new HttpError(400, "content required");
-        const dir = docsDir(store.active());
+        const dir = docsDir(userStore(address).active());
         if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
         writeFileSync(join(dir, path), body.content, "utf-8");
         return { path, saved: true };
     },
 
-    // What the network sees for the active repo: latest version of every note
-    // plus the link graph, reduced from the namespace's append-only history.
-    "GET /api/remote": async () => {
-        const repo = store.active();
+    "GET /api/remote": async ({ address }) => {
+        const repo = userStore(address).active();
         const { contents, latest } = await remoteState(repo);
         const notes = [...latest.entries()].map(([path, v]) => ({
-            path,
-            cid: v.cid,
+            path, cid: v.cid,
             title: firstHeading(v.payload.content, path.replace(/\.md$/, "")),
             updatedAt: v.payload.updatedAt ?? null,
         }));
         return { notes, edges: latestEdges(contents, latest) };
     },
 
-    // Materialize remote state into the active repo's dir — the "git pull".
-    "POST /api/pull": async () => {
-        const repo = store.active();
+    "POST /api/pull": async ({ address }) => {
+        const repo = userStore(address).active();
         const { latest } = await remoteState(repo);
         const dir = docsDir(repo);
         if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
         const written = [];
+        const skippedEncrypted = [];
         for (const [path, v] of latest) {
             assertNotePath(path);
+            // Encrypted notes only decrypt in the owner's browser — the server
+            // must never overwrite local plaintext with the "🔒" placeholder.
+            if (v.payload.enc !== undefined) { skippedEncrypted.push(path); continue; }
             const file = join(dir, path);
             if (existsSync(file) && readFileSync(file, "utf-8") === v.payload.content) continue;
             writeFileSync(file, v.payload.content, "utf-8");
             written.push(path);
         }
-        return { written };
+        return { written, skippedEncrypted };
     },
 
-    // Snapshot the active repo's dir into a commit and settle it — "commit && push".
-    "POST /api/publish": async ({ body }) => {
-        const repo = store.active();
-        if (!writable(repo)) {
-            throw new HttpError(403,
-                "this repo tracks someone else's namespace — you can read and sync, but only " +
-                "the owner's wallet can push. Create a repo under your own address to publish.");
-        }
+    // ── Self-custodial publish: prepare (keyless, server) → sign+send (browser)
+    //    → settle (record head). The server builds and flushes the commit but
+    //    NEVER signs; it hands back the unsigned settlement tx.
+    "POST /api/publish/prepare": async ({ address, body }) => {
+        const repo = body.namespace ? userStore(address).get(body.namespace) : userStore(address).active();
+        if (repo.owner !== address) throw new HttpError(403, "not your repo — only the owner's wallet can publish");
+
         const t0 = Date.now();
-        const { tip, latest } = await remoteState(repo);
+        const oldRoot = await readNamespaceHead(address);
+        const parent = oldRoot === ZERO_BYTES32 ? undefined : fangorn.engine.commitCidFromRootHex(oldRoot);
+        const { latest } = await remoteState(repo);
         const graph = buildWikiGraph(docsDir(repo), latest);
         if (graph.vertices.length === 0) throw new HttpError(400, `${repo.dir}/ has no markdown files`);
 
-        // Private repo: seal each note's content before it leaves this machine.
-        // path + updatedAt stay clear (identity/ordering); content becomes `enc`.
-        // buildWikiGraph reuses the (decrypted) remote payload verbatim when a
-        // note is unchanged — so a payload that already carries `enc` is
-        // untouched: keep that ciphertext (stable CID, no re-upload) and only
-        // seal notes whose content actually changed. Sealing is non-determin-
-        // istic (random nonce), so re-sealing an unchanged note would needlessly
-        // churn its CID every publish.
+        // Private repo: the browser sealed each note (content → hex `enc`) with a
+        // key only it holds. Swap content→enc before it hits the commit — the
+        // server pins ciphertext it can't read. path + updatedAt stay clear
+        // (identity/ordering); filenames leak, bodies don't.
+        // ponytail: re-seals every note each publish (fresh nonce → new CID);
+        // the server can't decrypt remote to detect unchanged notes, so no reuse.
         if (repo.visibility === "private") {
+            const sealed = body.sealed ?? {};
             for (const v of graph.vertices) {
-                const { content, ...rest } = v.payload; // rest: {path, updatedAt, [enc]}
-                v.payload = rest.enc !== undefined
-                    ? rest
-                    : { ...rest, enc: sealContent(repo.namespace, rest.path, content) };
+                const enc = sealed[v.payload.path];
+                if (!enc) throw new HttpError(400, `missing sealed content for ${v.payload.path} — is the wallet unlocked?`);
+                const { content, ...rest } = v.payload; // rest: {path, updatedAt}
+                v.payload = { ...rest, enc };
             }
         }
-        const tRead = Date.now();
 
-        // Parent on the on-chain tip, not the local head: a publisher's root
-        // spans ALL of its namespaces, so building on anything older would drop
-        // sibling namespaces' recent state when this commit settles.
         const commit = await fangorn.commit({
             namespace: repo.namespace,
             vertices: graph.vertices,
             edges: graph.edges,
-            parent: tip ?? repo.head ?? undefined,
+            parent,
             message: body.message || "update wiki",
         });
-        const tCommit = Date.now();
-        const { txHash, onChainTip } = await fangorn.push(commit.commitCid);
-        remoteCache.delete(repo.namespace); // re-walk the new tip (cheap — blocks cached)
-        store.setHead(repo.namespace, commit.commitCid);
-
-        const timings = { readMs: tRead - t0, commitMs: tCommit - tRead, pushMs: Date.now() - tCommit };
-        console.log(`[publish:${repo.namespace}] read ${(timings.readMs / 1000).toFixed(1)}s · commit+flush ${(timings.commitMs / 1000).toFixed(1)}s · push ${(timings.pushMs / 1000).toFixed(1)}s`);
+        const data = encodeFunctionData({ abi: REGISTRY_ABI, functionName: "commitStateRoot", args: [oldRoot, rootHexFromCid(commit.commitCid)] });
+        // Wallet fee estimation runs too tight for Arbitrum Sepolia's live base
+        // fee — quote fees ourselves with headroom. maxFeePerGas is only a
+        // ceiling (you pay baseFee+priority), so 2× is safe, not overpaying.
+        const { maxFeePerGas, maxPriorityFeePerGas } = await publicClient.estimateFeesPerGas();
+        console.log(`[prepare:${cacheKey(repo)}] commit+flush ${((Date.now() - t0) / 1000).toFixed(1)}s → ${commit.commitCid}`);
         return {
+            namespace: repo.namespace,
             commitCid: commit.commitCid,
-            txHash,
-            onChainTip,
-            visibility: repo.visibility,
             staged: { vertices: graph.vertices.length, edges: graph.edges.length },
-            timings,
+            tx: {
+                to: REGISTRY, data, chainId: CHAIN.id,
+                maxFeePerGas: toHex(maxFeePerGas * 2n),
+                maxPriorityFeePerGas: toHex(maxPriorityFeePerGas),
+            },
         };
     },
 
-    "GET /api/history": async () => {
-        const { head } = store.active();
+    // Record the settled head after the browser's tx confirms.
+    "POST /api/settle": async ({ address, body }) => {
+        const namespace = String(body.namespace ?? "");
+        const repo = userStore(address).get(namespace);
+        if (repo.owner !== address) throw new HttpError(403, "not your repo");
+        userStore(address).setHead(namespace, String(body.commitCid ?? ""));
+        remoteCache.delete(cacheKey(repo));
+        return { ok: true, head: body.commitCid ?? null, txHash: body.txHash ?? null };
+    },
+
+    "GET /api/history": async ({ address }) => {
+        const { head } = userStore(address).active();
         if (!head) return { commits: [] };
         const commits = [];
         for await (const c of fangorn.log(head, 50)) commits.push(c);
@@ -468,10 +427,6 @@ const routes = {
 };
 
 // ─── Static SPA (production) ────────────────────────────────────────────────
-//
-// In dev the Vite server serves the frontend and proxies /api here. In a built
-// image there is no Vite: serve dist/ ourselves and fall back to index.html so
-// client-side routing works. No-op if dist/ was never built (dev runs).
 
 const DIST = join(ROOT, "dist");
 const MIME = {
@@ -482,7 +437,6 @@ const MIME = {
 
 function serveStatic(res, pathname) {
     if (!existsSync(DIST)) return sendJson(res, 404, { error: "no dist/ — run `vite build`" });
-    // Resolve within DIST; anything escaping it or missing falls back to the SPA shell.
     const rel = normalize(pathname).replace(/^(\.\.[/\\])+/, "");
     let file = join(DIST, rel);
     if (!file.startsWith(DIST) || !existsSync(file) || pathname === "/") file = join(DIST, "index.html");
@@ -493,10 +447,9 @@ function serveStatic(res, pathname) {
 const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
-    if (req.method === "GET" && url.pathname === "/api/events") return handleEvents(res);
+    if (req.method === "GET" && url.pathname === "/api/events") return handleEvents(req, res, url);
     if (req.method === "GET" && !url.pathname.startsWith("/api/")) return serveStatic(res, url.pathname);
 
-    // Collapse "<METHOD> /api/notes/<path>" into a :path param; else match literally.
     let key = `${req.method} ${url.pathname}`;
     const params = {};
     const noteMatch = url.pathname.match(/^\/api\/notes\/(.+)$/);
@@ -509,6 +462,8 @@ const server = createServer(async (req, res) => {
     if (!handler) return sendJson(res, 404, { error: `no route: ${key}` });
 
     try {
+        const bearer = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+        params.address = await authenticate(bearer, req.headers["x-wallet-address"]);
         if (params.path) assertNotePath(params.path);
         if (req.method === "PUT" || req.method === "POST") params.body = await readJson(req);
         sendJson(res, 200, await handler(params));
@@ -519,17 +474,39 @@ const server = createServer(async (req, res) => {
     }
 });
 
-server.listen(PORT, () => {
-    const active = store.active();
-    console.log(`fangornmd server → http://localhost:${PORT}`);
-    console.log(`  tracking:  ${store.list().map((r) => r.namespace).join(", ")}`);
-    console.log(`  active:    ${active.namespace} (${active.visibility}) ${writable(active) ? "(writable)" : "(read-only)"}`);
-    console.log(`  wallet:    ${fangorn.getAddress()}`);
-    watchActiveDocs();
+// ─── Live co-editing (Yjs relay) ────────────────────────────────────────────
+//
+// The real-time collaborative-draft layer for PUBLIC repos. The server is a
+// PURE RELAY: it shuttles Yjs sync + awareness messages between everyone in a
+// room (room = owner/namespace/note) and never interprets the content — same
+// "holds no user data" posture as the rest of the server. The durable, signed
+// layer is still Publish (owner-only); this is just the shared unsaved buffer
+// below it. Each collaborator's own editor autosaves the merged text to their
+// working tree, so Publish stays exactly as-is.
+//
+// Private repos never open a room (their plaintext would be readable here), so
+// there's nothing to leak — that gate lives in the browser (public repos only).
+// ponytail: any authenticated user may join any room — no per-repo allowlist
+// yet. Add owner-managed allowlists with the private/team work (Increment 4b).
+const yws = new WebSocketServer({ noServer: true });
+server.on("upgrade", async (req, socket, head) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    if (!url.pathname.startsWith("/yjs/")) return; // not a collab socket
+    try {
+        await authenticate(url.searchParams.get("token"), url.searchParams.get("address"));
+    } catch {
+        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        return socket.destroy();
+    }
+    // Room = the URL path after /yjs/ (an opaque key; peers agree on it).
+    const docName = url.pathname.slice("/yjs/".length);
+    yws.handleUpgrade(req, socket, head, (conn) => setupWSConnection(conn, req, { docName }));
+});
 
-    // Warm the active repo's remote-state cache so the first publish/pull
-    // doesn't pay for the cold gateway walk.
-    remoteState(active)
-        .then(({ latest }) => console.log(`[remote:${active.namespace}] cache warmed — ${latest.size} note(s) at tip`))
-        .catch((err) => console.warn(`[remote:${active.namespace}] cache warm failed (will retry on demand): ${err.message}`));
+server.listen(PORT, () => {
+    mkdirSync(USERS_DIR, { recursive: true });
+    console.log(`fangornmd server → http://localhost:${PORT}`);
+    console.log(`  mode:    multi-tenant relay (self-custodial — holds no user keys)`);
+    console.log(`  service: ${fangorn.getAddress()} (engine + Pinata only)`);
+    console.log(`  privy:   ${PRIVY_APP_ID}`);
 });

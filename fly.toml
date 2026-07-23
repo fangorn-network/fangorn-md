@@ -1,0 +1,35 @@
+# Fly.io deploy for fangornmd.
+#
+# ONE always-on machine, by design: the Yjs live-collab rooms and the per-user
+# Fangorn subscriptions (SSE) live in THIS process's memory. Scaling out would
+# split collaborators across machines that don't share those rooms, so keep it
+# single-instance (no auto-stop, no HA) until there's a shared backing store.
+#
+# Change `app` to a name that's free (Fly app names are global).
+app = "fangornmd"
+primary_region = "iad"
+
+[build]
+  [build.args]
+    # Public Privy app id — Vite inlines it into the browser bundle at BUILD
+    # time, and the Dockerfile's ENV carries the same value to runtime for JWKS
+    # verification. It's public (shipped to every browser), so baking it is fine.
+    # Replace if you point at a different Privy app.
+    VITE_PRIVY_APP_ID = "cmnxrwbjl00aa0dlart5xkemq"
+
+[env]
+  PORT = "8787"
+  DATA_DIR = "/app/data"   # working trees + repo store land on the volume below
+
+# Persistent state. Without this, every deploy wipes unpublished drafts and each
+# user's tracked-repo list (published notes survive on-chain and re-pull).
+[[mounts]]
+  source = "fangornmd_data"
+  destination = "/app/data"
+
+[http_service]
+  internal_port = 8787
+  force_https = true          # Privy needs a secure context; wss:// rides this
+  auto_stop_machines = "off"  # SSE/WS are long-lived; don't suspend
+  auto_start_machines = false
+  min_machines_running = 1
