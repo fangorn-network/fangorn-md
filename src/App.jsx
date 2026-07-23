@@ -8,6 +8,24 @@ import Editor, { CollabEditor } from "./Editor.jsx";
 
 const short = (s) => (s ? `${s.slice(0, 8)}…${s.slice(-6)}` : "");
 
+// How long after our own save to treat an incoming "local-change" as our echo.
+// The server's watcher debounces 200ms before emitting, so this only has to
+// outlast that plus SSE delivery.
+const SELF_WRITE_MS = 1500;
+
+// Parse a repo reference to follow: a pasted share URL (?owner=&ns=&note=), or
+// a bare "owner/namespace". Returns { owner, ns, note } or null.
+export function parseRepoRef(input) {
+    const s = (input ?? "").trim();
+    try {
+        const u = new URL(s);
+        const owner = u.searchParams.get("owner"), ns = u.searchParams.get("ns");
+        if (owner && ns) return { owner, ns, note: u.searchParams.get("note") };
+    } catch { /* not a URL, fall through */ }
+    const m = s.match(/^(0x[0-9a-fA-F]{40})\s*\/\s*(.+)$/);
+    return m ? { owner: m[1], ns: m[2].trim(), note: null } : null;
+}
+
 // One node of the explicit page tree (stored server-side; see structure.js),
 // rendered recursively. Writers can drag to reorder/nest and rename/delete.
 function TreeRow({ node, depth, notes, active, writable, onOpen, onMove, onRename, onDelete }) {
@@ -80,7 +98,7 @@ function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow }) {
     const [form, setForm] = useState(null); // "new" | "follow" | null
     const [name, setName] = useState("");
     const [visibility, setVisibility] = useState("public");
-    const [owner, setOwner] = useState("");
+    const [ref, setRef] = useState("");
 
     const submitNew = (e) => {
         e.preventDefault();
@@ -90,18 +108,18 @@ function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow }) {
     };
     const submitFollow = (e) => {
         e.preventDefault();
-        if (!owner.trim() || !name.trim()) return;
-        onFollow(owner.trim(), name.trim());
-        setName(""); setOwner(""); setForm(null);
+        if (!ref.trim()) return;
+        onFollow(ref.trim());
+        setRef(""); setForm(null);
     };
 
     return (
         <div className="repo-bar">
             <div className="repo-bar-head">
-                <span className="repo-bar-label">repos</span>
+                <span className="repo-bar-label">your namespaces</span>
                 <span className="repo-bar-actions">
-                    <button className="btn ghost small" title="New repo" onClick={() => setForm(form === "new" ? null : "new")}>＋</button>
-                    <button className="btn ghost small" title="Follow a repo" onClick={() => setForm(form === "follow" ? null : "follow")}>⌕</button>
+                    <button className="btn ghost small" title="New namespace" onClick={() => setForm(form === "new" ? null : "new")}>＋</button>
+                    <button className="btn ghost small" title="Subscribe to a namespace" onClick={() => setForm(form === "follow" ? null : "follow")}>⌕</button>
                 </span>
             </div>
             <div className="repo-switch">
@@ -115,7 +133,7 @@ function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow }) {
                         <span className="repo-name">{r.namespace}</span>
                         {nudges[r.namespace] && r.namespace !== active && <span className="repo-dot" title="on-chain update" />}
                         {r.visibility === "private" && <span className="repo-badge" title="private (encrypted)">🔒</span>}
-                        {!r.writable && <span className="repo-badge" title="read-only follow">👁</span>}
+                        {!r.writable && <span className="repo-badge" title="read-only subscription">👁</span>}
                     </button>
                 ))}
             </div>
@@ -131,12 +149,41 @@ function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow }) {
             )}
             {form === "follow" && (
                 <form className="repo-form" onSubmit={submitFollow}>
-                    <input className="repo-input" placeholder="owner 0x…" value={owner} onChange={(e) => setOwner(e.target.value)} autoFocus />
-                    <input className="repo-input" placeholder="namespace" value={name} onChange={(e) => setName(e.target.value)} />
-                    <button className="btn small primary" type="submit">Follow</button>
+                    <input className="repo-input" placeholder="paste a share link or owner/namespace" value={ref} onChange={(e) => setRef(e.target.value)} autoFocus />
+                    <button className="btn small primary" type="submit">Subscribe</button>
                 </form>
             )}
         </div>
+    );
+}
+
+// Owner-only: the addresses allowed to co-edit this namespace's working tree.
+// This is a working-tree grant — collaborators write into the owner's files and
+// co-edit live, but settling a publish on-chain stays with the owner's wallet.
+function CollaboratorPanel({ repo, onSave, onClose }) {
+    const [text, setText] = useState((repo.collaborators ?? []).join("\n"));
+    return (
+        <form
+            className="collab-panel"
+            onSubmit={(e) => { e.preventDefault(); onSave(text.split(/[\s,]+/).filter(Boolean)); }}
+        >
+            <label className="collab-panel-label">
+                Collaborators — one wallet address per line. They can edit every note here; only you can publish.
+            </label>
+            <textarea
+                className="repo-input collab-panel-input"
+                rows={4}
+                spellCheck={false}
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                placeholder="0x…"
+                autoFocus
+            />
+            <div className="collab-panel-actions">
+                <button className="btn small primary" type="submit">Save</button>
+                <button className="btn ghost small" type="button" onClick={onClose}>Close</button>
+            </div>
+        </form>
     );
 }
 
@@ -165,10 +212,13 @@ export default function App({ address, onLogout }) {
         return provider.request({ method: "eth_sendTransaction", params: [params] });
     }, [wallets, address]);
     // Adapter: crypto.deriveSecret wants an async (msg) → hex-signature fn.
+    // Pass the address so Privy resolves the *connected* wallet (MetaMask) when
+    // there's no embedded wallet — without it the hook throws
+    // EMBEDDED_WALLET_NOT_FOUND for wallet-auth logins.
     const signForKey = useCallback(async (msg) => {
-        const r = await signMessage({ message: msg });
+        const r = await signMessage({ message: msg }, { address });
         return r?.signature ?? r;
-    }, [signMessage]);
+    }, [signMessage, address]);
     // Wire identity into the api layer before any effect fires (this component
     // only mounts once authenticated, so it's always valid here).
     setTokenGetter(getAccessToken);
@@ -183,6 +233,7 @@ export default function App({ address, onLogout }) {
     const [saveState, setSaveState] = useState("saved"); // saved | unsaved | saving
     const [nudges, setNudges] = useState({}); // namespace → last on-chain NamespaceChange
     const [status, setStatus] = useState(null); // { kind: ok|err|busy, text, tx? }
+    const [showCollabs, setShowCollabs] = useState(false);
     // An incoming share link (?owner=&ns=&note=) — parsed once on mount.
     const [share, setShare] = useState(() => {
         const p = new URLSearchParams(window.location.search);
@@ -190,6 +241,7 @@ export default function App({ address, onLogout }) {
         return owner && ns ? { owner, ns, note: p.get("note") } : null;
     });
     const saveTimer = useRef(null);
+    const lastSaveRef = useRef(0); // when we last wrote — see onLocalChange
     const dirtyRef = useRef(false);
     dirtyRef.current = saveState !== "saved";
 
@@ -211,12 +263,13 @@ export default function App({ address, onLogout }) {
     const loadActive = useCallback(async () => {
         const { active: activeNs, repos } = await api.repos();
         setRepos(repos);
-        setRepo(repos.find((r) => r.namespace === activeNs) ?? null);
+        const current = repos.find((r) => r.namespace === activeNs) ?? null;
+        setRepo(current);
         const list = await refreshNotes();
         const first = list.find((n) => n.path === "index.md") ?? list[0];
         if (first) await openNote(first.path);
         else { setActive(null); setContent(""); }
-        return activeNs;
+        return current;
     }, [refreshNotes, openNote]);
 
     // Boot.
@@ -235,6 +288,7 @@ export default function App({ address, onLogout }) {
             setSaveState("saving");
             try {
                 await api.save(active, next);
+                lastSaveRef.current = Date.now();
                 setSaveState("saved");
             } catch (err) {
                 setSaveState("unsaved");
@@ -247,6 +301,11 @@ export default function App({ address, onLogout }) {
         // The active repo's dir changed on disk (external editor, a pull):
         // refresh the sidebar, reload the open note unless there are unsaved edits.
         onLocalChange: async () => {
+            // …but our OWN autosave writes that dir too, and the server's watcher
+            // can't tell who wrote. Without this guard every save bounced back as
+            // two refetches plus a setContent, which lands mid-typing and can
+            // reset the caret — the editor felt laggy and ate backspaces.
+            if (Date.now() - lastSaveRef.current < SELF_WRITE_MS) return;
             const list = await refreshNotes();
             if (active && !dirtyRef.current && list.some((n) => n.path === active)) {
                 const note = await api.note(active);
@@ -280,15 +339,34 @@ export default function App({ address, onLogout }) {
         }
     };
 
-    const followRepo = async (owner, namespace) => {
-        setStatus({ kind: "busy", text: `following ${namespace}…` });
+    // Subscribe to someone else's repo: follow (idempotent), make it active, pull
+    // its notes, and open the shared page. Shared by the follow form and the
+    // incoming-share banner so both give the same one-step "paste → read" flow.
+    const subscribe = async ({ owner, ns, note }) => {
+        setStatus({ kind: "busy", text: `subscribing to ${ns}…` });
         try {
-            await api.followRepo(owner, namespace);
-            await loadActive();
-            setStatus({ kind: "ok", text: `following ${namespace} (read-only) — Pull to fetch notes` });
+            try { await api.followRepo(owner, ns); }
+            catch (e) { if (!/already tracking/i.test(e.message)) throw e; }
+            await api.setActiveRepo(ns);
+            await api.pull();
+            const joined = await loadActive();
+            if (note) await openNote(note).catch(() => {});
+            setStatus({
+                kind: "ok",
+                text: joined?.writable
+                    ? `joined ${ns} as a collaborator — edits are live; ${short(joined.owner)} publishes`
+                    : `subscribed to ${ns} (read-only — you'll still see edits live)`,
+            });
         } catch (err) {
-            setStatus({ kind: "err", text: `follow failed: ${err.message}` });
+            setStatus({ kind: "err", text: `subscribe failed: ${err.message}` });
         }
+    };
+
+    // From the follow form: accepts a pasted share link or "owner/namespace".
+    const followRepo = (input) => {
+        const ref = parseRepoRef(input);
+        if (!ref) { setStatus({ kind: "err", text: "not a share link or owner/namespace" }); return; }
+        subscribe(ref);
     };
 
     const pull = async () => {
@@ -315,30 +393,34 @@ export default function App({ address, onLogout }) {
         navigator.clipboard?.writeText(url.toString());
         setStatus({
             kind: "ok",
-            text: repo.head ? "share link copied — send it to a friend" : "link copied — Publish first so your friend sees anything",
+            text: repo.head ? "share link copied — anyone can paste it to subscribe" : "link copied — Publish first so subscribers see anything",
         });
+    };
+
+    const saveCollaborators = async (list) => {
+        try {
+            const updated = await api.setCollaborators(repo.namespace, list);
+            setRepo(updated);
+            setRepos((rs) => rs.map((r) => (r.namespace === updated.namespace ? updated : r)));
+            setShowCollabs(false);
+            setStatus({
+                kind: "ok",
+                text: updated.collaborators.length
+                    ? `${updated.collaborators.length} collaborator(s) — send them the Share link so they can open it`
+                    : "collaborators cleared",
+            });
+        } catch (err) {
+            setStatus({ kind: "err", text: `collaborators failed: ${err.message}` });
+        }
     };
 
     const cleanShareUrl = () => window.history.replaceState({}, "", window.location.pathname);
 
-    // Accept an incoming share: follow (idempotent), pull, open the shared note.
+    // Accept an incoming share link: same subscribe flow, then clear the banner.
     const acceptShare = async () => {
-        const { owner, ns, note } = share;
-        setStatus({ kind: "busy", text: `opening shared ${ns}…` });
-        try {
-            try { await api.followRepo(owner, ns); }
-            catch (e) { if (!/already tracking/i.test(e.message)) throw e; }
-            await api.setActiveRepo(ns);
-            await api.pull();
-            await loadActive();
-            if (note) await openNote(note).catch(() => {});
-            setStatus({ kind: "ok", text: `following ${ns} (read-only)` });
-        } catch (err) {
-            setStatus({ kind: "err", text: `couldn't open share: ${err.message}` });
-        } finally {
-            setShare(null);
-            cleanShareUrl();
-        }
+        await subscribe(share);
+        setShare(null);
+        cleanShareUrl();
     };
 
     const publish = async () => {
@@ -491,8 +573,14 @@ export default function App({ address, onLogout }) {
                 </nav>
                 {repo && (
                     <footer className="repo-info">
-                        <div><b>{repo.namespace}</b> · {repo.visibility}{repo.writable ? "" : " · read-only"}</div>
+                        <div>
+                            <b>{repo.namespace}</b> · {repo.visibility}
+                            {repo.isOwner ? "" : repo.writable ? " · collaborator" : " · read-only"}
+                        </div>
                         <div title={repo.owner}>owner {short(repo.owner)}</div>
+                        {repo.isOwner && repo.collaborators?.length > 0 && (
+                            <div title={repo.collaborators.join("\n")}>{repo.collaborators.length} collaborator(s)</div>
+                        )}
                         <div title={repo.head ?? ""}>head {repo.head ? short(repo.head) : "(none)"}</div>
                     </footer>
                 )}
@@ -501,9 +589,9 @@ export default function App({ address, onLogout }) {
             <main className="main">
                 {share && (
                     <div className="banner">
-                        🔗 A wiki was shared with you — <b>{share.ns}</b> by {short(share.owner)}
+                        🔗 A namespace was shared with you — <b>{share.ns}</b> by {short(share.owner)}
                         {share.note ? ` · ${share.note}` : ""}.
-                        <button className="btn" onClick={acceptShare} disabled={status?.kind === "busy"}>Follow &amp; open</button>
+                        <button className="btn" onClick={acceptShare} disabled={status?.kind === "busy"}>Subscribe &amp; open</button>
                         <button className="btn ghost" onClick={() => { setShare(null); cleanShareUrl(); }}>Dismiss</button>
                     </div>
                 )}
@@ -517,19 +605,40 @@ export default function App({ address, onLogout }) {
                 )}
                 <header className="topbar">
                     <span className="doc-title">{activeTitle ?? "—"}</span>
-                    <span className={`save-state ${saveState}`}>{saveState}</span>
+                    {/* Public notes live in the shared room — the server persists
+                        them, so there's no local save state to report. */}
+                    {repo?.visibility !== "public" && (
+                        <span className={`save-state ${saveState}`}>{saveState}</span>
+                    )}
                     <span className="spacer" />
                     {repo && repo.visibility !== "private" && (
-                        <button className="btn" onClick={shareLink} title="Copy a link so a friend can follow this wiki">
-                            Share
+                        <button className="btn share" onClick={shareLink} title="Copy a link — anyone can paste it to subscribe to this namespace">
+                            🔗 Share
                         </button>
                     )}
-                    {repo?.writable && (
+                    {repo?.isOwner && repo.visibility !== "private" && (
+                        <button
+                            className="btn"
+                            onClick={() => setShowCollabs((v) => !v)}
+                            title="Choose who can co-edit this namespace"
+                        >
+                            👥 {repo.collaborators?.length ?? 0}
+                        </button>
+                    )}
+                    {repo?.isOwner && (
                         <button className="btn primary" onClick={publish} disabled={status?.kind === "busy"}>
                             Publish
                         </button>
                     )}
                 </header>
+                {showCollabs && repo?.isOwner && (
+                    <CollaboratorPanel
+                        key={repo.namespace}
+                        repo={repo}
+                        onSave={saveCollaborators}
+                        onClose={() => setShowCollabs(false)}
+                    />
+                )}
                 {status && (
                     <div className={`status ${status.kind}`}>
                         {status.text}
@@ -543,21 +652,30 @@ export default function App({ address, onLogout }) {
                 )}
                 {active ? (
                     <>
+                        {/* Everyone on a public namespace joins the live room —
+                            read-only subscribers included, so they watch it
+                            change instead of staring at their last pull. The
+                            server seeds the room and persists it, and drops
+                            writes from anyone who isn't a collaborator. */}
                         {repo && repo.visibility === "public" ? (
                             <CollabEditor
                                 key={`${repo.owner}:${repo.namespace}:${active}`}
                                 owner={repo.owner}
                                 namespace={repo.namespace}
                                 note={active}
-                                content={content}
-                                onChange={onChange}
                                 onNavigate={navigate}
                                 address={address}
                                 getToken={getAccessToken}
-                                writable={repo.writable}
+                                readOnly={!repo.writable}
                             />
                         ) : (
-                            <Editor content={content} onChange={onChange} onNavigate={navigate} noteKey={active} />
+                            <Editor
+                                content={content}
+                                onChange={onChange}
+                                onNavigate={navigate}
+                                noteKey={active}
+                                readOnly={!repo?.writable}
+                            />
                         )}
                         {activeBacklinks.length > 0 && (
                             <footer className="backlinks">
@@ -571,7 +689,7 @@ export default function App({ address, onLogout }) {
                         )}
                     </>
                 ) : (
-                    <div className="empty">No notes yet — create one, or Pull if this is a followed repo.</div>
+                    <div className="empty">No notes yet — create one, or Pull if this is a subscribed namespace.</div>
                 )}
             </main>
         </div>

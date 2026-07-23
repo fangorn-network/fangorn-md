@@ -57,6 +57,8 @@ to buy, WebSockets supported.
 
 ```bash
 # one-time: install Tailscale, then enable HTTPS + Funnel in the admin console
+curl -fsSL https://tailscale.com/install.sh | sh
+
 tailscale up
 tailscale funnel --bg 8787
 tailscale funnel status          # prints your public URL

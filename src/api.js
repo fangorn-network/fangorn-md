@@ -40,6 +40,13 @@ export const api = {
     createRepo: (namespace, visibility) => post("/api/repos", { namespace, visibility }),
     followRepo: (owner, namespace) => post("/api/repos/follow", { owner, namespace }),
     setActiveRepo: (namespace) => post("/api/repos/active", { namespace }),
+    // Owner-only: the addresses allowed to co-edit this namespace's working tree.
+    setCollaborators: async (namespace, collaborators) =>
+        fetch("/api/collaborators", {
+            method: "PUT",
+            headers: await authHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({ namespace, collaborators }),
+        }).then(json),
     notes: () => get("/api/notes"),
     note: (path) => get(`/api/notes/${encodeURIComponent(path)}`),
     save: async (path, content) =>

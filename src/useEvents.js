@@ -11,19 +11,25 @@ import { useEffect, useRef } from "react";
 export function useEvents(handlers, { getToken, address }) {
     const ref = useRef(handlers);
     ref.current = handlers;
+    // getToken too: Privy memoises it on internal state, so it changes identity
+    // at least once after login. Keying the effect on it would tear down and
+    // rebuild the stream — and every rebuild costs the server a recursive fs
+    // watcher plus one chain subscription per tracked namespace.
+    const tokenRef = useRef(getToken);
+    tokenRef.current = getToken;
 
     useEffect(() => {
-        if (!getToken || !address) return;
+        if (!address) return;
         let source;
         let closed = false;
         (async () => {
-            const token = await getToken();
-            if (closed) return;
+            const token = await tokenRef.current?.();
+            if (closed || !token) return;
             const q = new URLSearchParams({ token, address });
             source = new EventSource(`/api/events?${q}`);
             source.addEventListener("local-change", (e) => ref.current.onLocalChange?.(JSON.parse(e.data)));
             source.addEventListener("remote-change", (e) => ref.current.onRemoteChange?.(JSON.parse(e.data)));
         })();
         return () => { closed = true; source?.close(); };
-    }, [getToken, address]);
+    }, [address]);
 }

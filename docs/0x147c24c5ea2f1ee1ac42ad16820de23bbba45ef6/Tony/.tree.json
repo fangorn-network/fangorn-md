@@ -1,0 +1,20 @@
+[
+  {
+    "path": "index.md",
+    "children": [
+      {
+        "path": "Pets.md",
+        "children": [
+          {
+            "path": "Theo.md",
+            "children": []
+          },
+          {
+            "path": "Tilly.md",
+            "children": []
+          }
+        ]
+      }
+    ]
+  }
+]

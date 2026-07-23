@@ -1,22 +1,31 @@
 * { box-sizing: border-box; margin: 0; }
 
 :root {
-    --bg: #1b1f24;
-    --bg-panel: #22272e;
-    --bg-input: #1b1f24;
-    --border: #373e47;
-    --text: #cdd9e5;
-    --text-dim: #768390;
+    --bg: #16191d;
+    --bg-panel: #1d2126;
+    --bg-input: #16191d;
+    --bg-hover: #262b32;
+    --border: #313840;
+    --text: #d6e0ea;
+    --text-dim: #7d8794;
     --accent: #4c9e6a;
+    --accent-soft: #4c9e6a26;
     --accent-text: #eafff1;
     --danger: #e5534b;
+    --radius: 8px;
+    --radius-sm: 6px;
+    --shadow: 0 1px 2px #0000004d;
 }
 
 body {
     font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
     background: var(--bg);
     color: var(--text);
+    -webkit-font-smoothing: antialiased;
 }
+
+/* One focus treatment for every control. */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .app { display: flex; height: 100vh; }
 
@@ -50,8 +59,8 @@ body {
     cursor: pointer;
     font-size: 14px;
 }
-.note-item:hover { background: var(--bg); }
-.note-item.active { background: var(--bg); outline: 1px solid var(--border); }
+.note-item:hover { background: var(--bg-hover); }
+.note-item.active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); font-weight: 600; }
 .tree-glyph { color: var(--text-dim); font-family: ui-monospace, monospace; }
 
 /* ── Draggable page tree ─────────────────────────────── */
@@ -132,8 +141,8 @@ body {
     cursor: pointer;
     font-size: 13px;
 }
-.repo-item:hover { background: var(--bg); }
-.repo-item.active { background: var(--bg); outline: 1px solid var(--border); font-weight: 600; }
+.repo-item:hover { background: var(--bg-hover); }
+.repo-item.active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); font-weight: 600; }
 .repo-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .repo-badge { font-size: 11px; }
 .repo-dot {
@@ -174,9 +183,10 @@ body {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 8px 16px;
-    background: #3b2e1a;
+    padding: 10px 16px;
+    background: linear-gradient(var(--accent-soft), var(--accent-soft)), var(--bg-panel);
     border-bottom: 1px solid var(--border);
+    box-shadow: inset 3px 0 0 var(--accent);
     font-size: 13px;
 }
 .status {
@@ -204,31 +214,86 @@ body {
     font-size: 12px;
 }
 .presence-label { color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; font-size: 10px; }
+/* "live" only reads as reassuring when it's true — say so when it isn't. */
+.presence-label.connected { color: #3fb950; }
+.presence-label.disconnected { color: #d29922; }
 .presence-chip {
     color: #fff;
     padding: 1px 8px;
     border-radius: 10px;
     font: 11px/1.6 ui-monospace, monospace;
 }
+.presence-note { color: var(--text-dim); font-size: 11px; margin-left: auto; }
+
+/* Owner's collaborator list (see CollaboratorPanel in App.jsx). */
+.collab-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-panel);
+}
+.collab-panel-label { color: var(--text-dim); font-size: 11px; }
+.collab-panel-input { font: 12px/1.6 ui-monospace, monospace; resize: vertical; }
+.collab-panel-actions { display: flex; gap: 6px; }
 .editor { flex: 1; display: flex; min-height: 0; justify-content: center; overflow-y: auto; }
 /* Single reading pane: markdown renders in place (see Editor.jsx decorations). */
 .editor-input {
     width: 100%;
-    max-width: 760px;
-    padding: 32px 28px 45vh;
+    max-width: 740px;
+    padding: 40px 32px 45vh;
     border: 0;
     outline: none;
     white-space: pre-wrap;
     word-break: break-word;
     background: var(--bg-input);
     color: var(--text);
-    font: 16px/1.75 system-ui, -apple-system, "Segoe UI", sans-serif;
+    font: 17px/1.8 system-ui, -apple-system, "Segoe UI", sans-serif;
+    caret-color: var(--accent);
 }
+.editor-input [data-slate-placeholder] { color: var(--text-dim); opacity: 0.55 !important; }
 /* Markdown syntax markers: collapsed to zero width unless the caret is on the
    line, so the text reads rendered but stays editable. */
 .md-syntax { font-size: 0; }
 .md-syntax-on { font-size: inherit; color: var(--text-dim); opacity: 0.6; }
 .md-link { color: #539bf5; cursor: pointer; }
+
+/* ── fenced code blocks ──────────────────────────────── */
+/* One block per line (see fenceLines in Editor.jsx), so the "block" is really a
+   run of adjacent lines sharing a background; only the fences get corners. */
+.md-cb {
+    background: var(--bg-panel);
+    font: 0.9em/1.6 ui-monospace, monospace;
+    padding: 0 12px;
+    white-space: pre-wrap;
+}
+.md-cb-open { padding-top: 10px; border-radius: 6px 6px 0 0; }
+.md-cb-close { padding-bottom: 10px; border-radius: 0 0 6px 6px; }
+/* The ``` lines collapse to nothing (their padding becomes the block's) and
+   reappear when the caret is on them, so the fence is editable but unseen. */
+.md-cb-open, .md-cb-close { font-size: 0; }
+.md-cb-on { font-size: 0.8em; color: var(--text-dim); opacity: 0.6; }
+
+/* ── LaTeX ───────────────────────────────────────────── */
+/* The raw $…$ source stays in the DOM (zero-width, via .md-syntax) so Slate can
+   still resolve selections onto it; KaTeX renders alongside. Put the caret on
+   the line and .md-math-src shows the source again for editing. */
+/* Both stay inline-block on purpose: a block-level box inside an inline leaf
+   confuses contenteditable caret placement (Enter/Backspace land in the wrong
+   spot). Display math gets full width instead of `display:block`. */
+.md-math-render { display: inline-block; cursor: default; user-select: none; }
+.md-math-render.display { width: 100%; margin: 0.4em 0; text-align: center; }
+.md-math-src {
+    font-family: ui-monospace, monospace;
+    font-size: 0.92em;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 4px;
+    padding: 0 3px;
+}
+/* KaTeX ships its own error colour; keep it legible on the dark panel. */
+.katex-error { color: var(--danger) !important; }
 
 .backlinks {
     display: flex;
@@ -247,17 +312,51 @@ body {
 .btn {
     padding: 5px 14px;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--bg-panel);
     color: var(--text);
     cursor: pointer;
     font-size: 13px;
+    font-family: inherit;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
 }
-.btn:hover { border-color: var(--text-dim); }
+.btn:hover { border-color: var(--text-dim); background: var(--bg-hover); }
+.btn:active { transform: translateY(1px); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
-.btn.primary:disabled { opacity: 0.5; cursor: default; }
+.btn.primary:hover { filter: brightness(1.1); }
+.btn.primary:disabled { opacity: 0.5; cursor: default; transform: none; }
 .btn.ghost { border: 0; background: none; color: var(--text-dim); }
+.btn.ghost:hover { background: var(--bg-hover); color: var(--text); }
 .btn.small { padding: 2px 9px; }
+/* Share reads as the second action after Publish, not as chrome. */
+.btn.share { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.btn.share:hover { background: var(--accent); color: var(--accent-text); }
+
+/* ── Formatting toolbar ──────────────────────────────── */
+.fmt-bar {
+    display: flex;
+    align-items: center;
+    gap: 1px;
+    padding: 6px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-panel);
+    flex-wrap: wrap;
+}
+.fmt-btn {
+    min-width: 30px;
+    height: 28px;
+    padding: 0 7px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    font: 600 13px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+    transition: background 0.12s, color 0.12s;
+}
+.fmt-btn:hover { background: var(--bg-hover); color: var(--text); }
+.fmt-btn:active { background: var(--accent-soft); color: var(--accent); }
+.fmt-sep { width: 1px; height: 18px; margin: 0 6px; background: var(--border); }
 
 /* ── Login gate + account bar ─────────────────────────────────────────── */
 .gate { display: flex; align-items: center; justify-content: center; height: 100vh; background: var(--bg); }

@@ -8,7 +8,9 @@ import { createPublicClient, http, encodeFunctionData, toHex } from "viem";
 import { CID } from "multiformats/cid";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { WebSocketServer } from "ws";
-import { setupWSConnection } from "@y/websocket-server/utils";
+import { setupWSConnection, setPersistence, docs as yRooms } from "@y/websocket-server/utils";
+import * as Y from "yjs";
+import { docMarkdown, seedFromMarkdown, isReadFrame } from "./ydoc.js";
 import { buildWikiGraph, latestByPath, latestEdges } from "./graph.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -94,28 +96,64 @@ async function authenticate(token, assertedAddress) {
 //
 // One file per user at .fangorn/users/<address>.json — no shared mutable state
 // between users. Same shape as the old repos.json: { active, repos: { ns → … } }.
-// A repo is (owner, namespace); repos the user owns are writable, follows aren't.
+// A repo is (owner, namespace).
+//
+// COLLABORATION. The owner's repo record carries `collaborators: [address]`.
+// That list is the single source of truth — everyone else's store just points at
+// (owner, namespace), so permission questions are answered by reading the
+// OWNER's file, never by copying the grant around.
+//
+// A collaborator works IN THE OWNER'S DIRECTORY: same files, same sidebar, same
+// .tree.json. That's the whole trick. Giving each collaborator their own copy
+// (what a plain follow does) means a friend's edits never reach the tree the
+// owner publishes — the owner would have to have every note open for the CRDT
+// to carry them across. One shared tree makes "the owner publishes what we all
+// wrote" true by construction. Read-only followers keep their own pulled copy.
 
 const relDir = (address, namespace) => `docs/${address}/${namespace}`;
+const userFile = (address) => join(USERS_DIR, `${address}.json`);
+const readUserState = (address) => {
+    try { return JSON.parse(readFileSync(userFile(address), "utf-8")); }
+    catch { return { active: null, repos: {} }; }
+};
+const collaboratorsOf = (owner, namespace) => readUserState(owner).repos?.[namespace]?.collaborators ?? [];
+// Edit rights = working-tree rights. Publishing stays owner-only everywhere.
+const canEdit = (repo, address) => repo.owner === address || collaboratorsOf(repo.owner, repo.namespace).includes(address);
 
 function userStore(address) {
-    const file = join(USERS_DIR, `${address}.json`);
+    const file = userFile(address);
     const read = () => (existsSync(file) ? JSON.parse(readFileSync(file, "utf-8")) : { active: null, repos: {} });
     const write = (s) => writeFileSync(file, JSON.stringify(s, null, 2), "utf-8");
+    // Point editors at the owner's tree; leave read-only followers on their own.
+    const resolve = (r) => (r && canEdit(r, address) ? { ...r, dir: relDir(r.owner, r.namespace) } : r);
     return {
         read,
-        list: () => Object.values(read().repos),
-        get(ns) { const r = read().repos[ns]; if (!r) throw new HttpError(404, `no such repo: ${ns}`); return r; },
-        activeOrNull() { const s = read(); return s.active ? s.repos[s.active] : null; },
+        list: () => Object.values(read().repos).map(resolve),
+        get(ns) { const r = read().repos[ns]; if (!r) throw new HttpError(404, `no such repo: ${ns}`); return resolve(r); },
+        activeOrNull() { const s = read(); return s.active ? resolve(s.repos[s.active]) : null; },
         active() { const r = this.activeOrNull(); if (!r) throw new HttpError(404, "no active repo — create one first"); return r; },
         setActive(ns) { const s = read(); if (!s.repos[ns]) throw new HttpError(404, `no such repo: ${ns}`); s.active = ns; write(s); },
         setHead(ns, cid) { const s = read(); s.repos[ns].head = cid; write(s); },
         add(repo) { const s = read(); s.repos[repo.namespace] = repo; s.active = repo.namespace; write(s); },
+        setCollaborators(ns, list) {
+            const s = read();
+            if (!s.repos[ns]) throw new HttpError(404, `no such repo: ${ns}`);
+            if (s.repos[ns].owner !== address) throw new HttpError(403, "not your repo");
+            s.repos[ns].collaborators = list;
+            write(s);
+        },
     };
 }
 
 const docsDir = (repo) => join(DATA_DIR, repo.dir);
-const publicRepo = (repo, address) => ({ ...repo, writable: repo.owner === address });
+// `writable` = may edit the working tree (owner or collaborator).
+// `isOwner`  = may publish on-chain and manage the collaborator list.
+const publicRepo = (repo, address) => ({
+    ...repo,
+    writable: canEdit(repo, address),
+    isOwner: repo.owner === address,
+    collaborators: collaboratorsOf(repo.owner, repo.namespace),
+});
 
 // ─── Explicit page tree ───────────────────────────────────────────────────────
 //
@@ -214,21 +252,41 @@ function decodeVertex(v) {
 
 // Reading a namespace walks the pail tree from the owner's on-chain root — many
 // sequential gateway fetches. Cache per (owner, namespace) keyed by the tip.
+//
+// LRU-bounded so it can't grow without limit (one always-on process, every
+// distinct namespace ever touched used to stick forever). A plain Map keeps
+// insertion order, so promote-on-read (delete+re-set) puts hot keys last and we
+// evict the oldest (first) once over the cap. The durable copy is on-chain, so
+// an evicted entry just re-walks on next access.
+// ponytail: fixed entry count, not byte-aware; switch to a size budget if a few
+// huge namespaces blow memory before the count cap bites.
+const REMOTE_CACHE_MAX = 256;
 const remoteCache = new Map();
 const cacheKey = (repo) => `${repo.owner}/${repo.namespace}`;
+const cacheGet = (key) => {
+    const v = remoteCache.get(key);
+    if (v) { remoteCache.delete(key); remoteCache.set(key, v); } // promote to MRU
+    return v;
+};
+const cacheSet = (key, v) => {
+    remoteCache.delete(key);
+    remoteCache.set(key, v);
+    if (remoteCache.size > REMOTE_CACHE_MAX) remoteCache.delete(remoteCache.keys().next().value);
+};
 
 async function remoteState(repo) {
+    const key = cacheKey(repo);
     const tip = await fangorn.onChainTip(repo.owner);
-    const cached = remoteCache.get(cacheKey(repo));
+    let cached = cacheGet(key);
     if (!cached || cached.tip !== tip) {
         const started = Date.now();
         const raw = await fangorn.engine.listNamespace(repo.namespace, repo.owner);
         const contents = { ...raw, vertices: raw.vertices.map(decodeVertex) };
-        remoteCache.set(cacheKey(repo), { tip, contents });
-        console.log(`[remote:${cacheKey(repo)}] walked ${contents.vertices.length} vertices / ${contents.edges.length} edges in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        cached = { tip, contents };
+        cacheSet(key, cached);
+        console.log(`[remote:${key}] walked ${contents.vertices.length} vertices / ${contents.edges.length} edges in ${((Date.now() - started) / 1000).toFixed(1)}s`);
     }
-    const contents = remoteCache.get(cacheKey(repo)).contents;
-    return { tip, contents, latest: latestByPath(contents) };
+    return { tip, contents: cached.contents, latest: latestByPath(cached.contents) };
 }
 
 // ─── Live events (SSE) ────────────────────────────────────────────────────────
@@ -247,16 +305,23 @@ async function handleEvents(req, res, url) {
     res.write("retry: 3000\n\n");
     const write = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data, bigintReplacer)}\n\n`);
 
-    const userDir = join(DATA_DIR, "docs", address);
-    mkdirSync(userDir, { recursive: true });
+    // Watch our own root plus every shared tree we collaborate in — a repo we
+    // co-edit lives under the OWNER's directory, so watching docs/<us> alone
+    // would miss every change a friend makes.
+    const repos = userStore(address).list();
+    const dirs = new Set([join(DATA_DIR, "docs", address), ...repos.map((r) => join(DATA_DIR, r.dir))]);
     let debounce = null;
-    const localWatcher = watch(userDir, { recursive: true }, () => {
+    const onLocal = () => {
         clearTimeout(debounce);
         debounce = setTimeout(() => write("local-change", {}), 200);
+    };
+    const localWatchers = [...dirs].map((dir) => {
+        mkdirSync(dir, { recursive: true });
+        return watch(dir, { recursive: true }, onLocal);
     });
 
     const aborts = [];
-    for (const repo of userStore(address).list()) {
+    for (const repo of repos) {
         const abort = new AbortController();
         aborts.push(abort);
         (async () => {
@@ -275,7 +340,7 @@ async function handleEvents(req, res, url) {
     req.on("close", () => {
         clearInterval(heartbeat);
         clearTimeout(debounce);
-        localWatcher.close();
+        for (const w of localWatchers) w.close();
         for (const a of aborts) a.abort();
     });
 }
@@ -335,6 +400,20 @@ const routes = {
         return publicRepo(s.active(), address);
     },
 
+    // Owner-only: who else may edit this namespace's working tree. This is a
+    // working-tree grant, not an on-chain one — a collaborator can write and
+    // co-edit, but only the owner's wallet can settle a publish. They still need
+    // the share link to start tracking the namespace.
+    "PUT /api/collaborators": async ({ address, body }) => {
+        const s = userStore(address);
+        const namespace = String(body.namespace ?? "") || s.active().namespace;
+        const list = [...new Set((body.collaborators ?? []).map((a) => String(a).trim().toLowerCase()))]
+            .filter((a) => a !== address);
+        for (const a of list) if (!/^0x[0-9a-f]{40}$/.test(a)) throw new HttpError(400, `invalid address: ${a}`);
+        s.setCollaborators(namespace, list);
+        return publicRepo(s.get(namespace), address);
+    },
+
     // ── Notes (operate on the active repo's dir) ──
     // Returns the notes plus the explicit page `tree`. Per-note `links` are the
     // markdown [[wikilinks]] — kept only for backlinks/navigation, not structure.
@@ -355,7 +434,7 @@ const routes = {
     // Drag-and-drop persisted the reordered hierarchy.
     "PUT /api/tree": async ({ address, body }) => {
         const repo = userStore(address).active();
-        if (repo.owner !== address) throw new HttpError(403, "not your repo");
+        if (!canEdit(repo, address)) throw new HttpError(403, "read-only — ask the owner to add you as a collaborator");
         if (!Array.isArray(body.tree)) throw new HttpError(400, "tree array required");
         writeTree(repo, body.tree);
         return { tree: reconcileTree(repo).tree };
@@ -377,7 +456,7 @@ const routes = {
 
     "DELETE /api/notes/:path": async ({ address, path }) => {
         const repo = userStore(address).active();
-        if (repo.owner !== address) throw new HttpError(403, "not your repo");
+        if (!canEdit(repo, address)) throw new HttpError(403, "read-only — ask the owner to add you as a collaborator");
         const file = join(docsDir(repo), path);
         if (!existsSync(file)) throw new HttpError(404, `no such note: ${path}`);
         rmSync(file);
@@ -389,7 +468,7 @@ const routes = {
     // Existing [[wikilinks]] to the old name are left as-is (navigation only).
     "POST /api/notes/:path/rename": async ({ address, path, body }) => {
         const repo = userStore(address).active();
-        if (repo.owner !== address) throw new HttpError(403, "not your repo");
+        if (!canEdit(repo, address)) throw new HttpError(403, "read-only — ask the owner to add you as a collaborator");
         let to = String(body.to ?? "").trim();
         if (!to.endsWith(".md")) to += ".md";
         assertNotePath(to);
@@ -414,6 +493,9 @@ const routes = {
 
     "POST /api/pull": async ({ address }) => {
         const repo = userStore(address).active();
+        // A collaborator already lives in the owner's live tree — pulling would
+        // overwrite everyone's in-flight drafts with the last published snapshot.
+        if (repo.owner !== address && canEdit(repo, address)) return { written: [], skippedEncrypted: [], shared: true };
         const { latest } = await remoteState(repo);
         const dir = docsDir(repo);
         if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -438,6 +520,12 @@ const routes = {
     "POST /api/publish/prepare": async ({ address, body }) => {
         const repo = body.namespace ? userStore(address).get(body.namespace) : userStore(address).active();
         if (repo.owner !== address) throw new HttpError(403, "not your repo — only the owner's wallet can publish");
+
+        // Live rooms write to disk on a debounce, so publishing seconds after
+        // someone types could snapshot a file that's a beat behind. Push every
+        // open room for this namespace down first — otherwise a collaborator's
+        // last sentence silently misses the commit.
+        flushRooms(repo.owner, repo.namespace);
 
         const t0 = Date.now();
         const oldRoot = await readNamespaceHead(address);
@@ -578,33 +666,119 @@ const server = createServer(async (req, res) => {
     }
 });
 
-// ─── Live co-editing (Yjs relay) ────────────────────────────────────────────
+// ─── Live co-editing (Yjs rooms) ────────────────────────────────────────────
 //
-// The real-time collaborative-draft layer for PUBLIC repos. The server is a
-// PURE RELAY: it shuttles Yjs sync + awareness messages between everyone in a
-// room (room = owner/namespace/note) and never interprets the content — same
-// "holds no user data" posture as the rest of the server. The durable, signed
-// layer is still Publish (owner-only); this is just the shared unsaved buffer
-// below it. Each collaborator's own editor autosaves the merged text to their
-// working tree, so Publish stays exactly as-is.
+// The real-time layer for PUBLIC repos. One room per note, named
+// `${owner}:${namespace}:${note}`. Everyone who can see the namespace joins and
+// sees keystrokes live; only the owner and their named collaborators may type.
 //
-// Private repos never open a room (their plaintext would be readable here), so
-// there's nothing to leak — that gate lives in the browser (public repos only).
-// ponytail: any authenticated user may join any room — no per-repo allowlist
-// yet. Add owner-managed allowlists with the private/team work (Increment 4b).
+// The server owns the room's lifecycle rather than relaying blindly:
+//
+//   seed    — the room is filled from the owner's file when it's created, so a
+//             viewer who arrives first sees the document instead of a blank
+//             page (the old "first writer seeds it" rule meant readers, and
+//             collaborators who opened before the owner, got nothing).
+//   persist — the merged text is written back to the owner's working tree on a
+//             debounce. This is what makes collaboration real: a friend's
+//             edits land in the tree the owner publishes even when the owner
+//             isn't connected. Previously each peer saved only to their own
+//             copy, so a note the owner didn't have open lost every edit.
+//
+// The file stays the durable layer; the room is the shared unsaved buffer above
+// it. Publishing is untouched, and still owner-only.
+//
+// Private repos never open a room — their content is ciphertext the server
+// can't read, and a live plaintext room would defeat that.
+
+// Resolve a room name to the file it mirrors, or null if it isn't a room anyone
+// may open. Every component is validated — the note name reaches the filesystem.
+function roomFile(room) {
+    const [owner, namespace, note] = String(room).split(":");
+    if (!/^0x[0-9a-f]{40}$/.test(owner ?? "")) return null;
+    if (!NAMESPACE.test(namespace ?? "") || !NOTE_PATH.test(note ?? "")) return null;
+    const repo = readUserState(owner).repos?.[namespace];
+    if (!repo || repo.owner !== owner || repo.visibility === "private") return null;
+    return { owner, namespace, note, file: join(DATA_DIR, relDir(owner, namespace), note) };
+}
+
+const FLUSH_MS = 800;
+
+// Force every open room in a namespace to disk (used just before Publish reads
+// the files). Rooms with no bound file are skipped by the optional call.
+const flushRooms = (owner, namespace) => {
+    const prefix = `${owner}:${namespace}:`;
+    for (const [room, doc] of yRooms) if (room.startsWith(prefix)) doc.flushToDisk?.();
+};
+
+setPersistence({
+    provider: null,
+    bindState: (room, doc) => {
+        const target = roomFile(room);
+        if (!target) return;
+        const xml = doc.get("content", Y.XmlText);
+        if (xml.length === 0 && existsSync(target.file)) {
+            seedFromMarkdown(xml, readFileSync(target.file, "utf-8"));
+        }
+        let timer = null;
+        const flush = () => {
+            clearTimeout(timer);
+            timer = null;
+            const md = docMarkdown(xml);
+            // Never conjure a file from an empty room — that's how a race
+            // between "room created" and "first client synced" would truncate.
+            if (!existsSync(target.file)) { if (!md.trim()) return; }
+            else if (readFileSync(target.file, "utf-8") === md) return;
+            writeFileSync(target.file, md, "utf-8");
+        };
+        doc.flushToDisk = flush;
+        // Registered after seeding, so the seed itself doesn't schedule a write.
+        doc.on("update", () => { clearTimeout(timer); timer = setTimeout(flush, FLUSH_MS); });
+    },
+    // Last peer left: write the final text. The doc is then destroyed and the
+    // next visitor re-seeds from the file — which also stops rooms accumulating
+    // in memory for the life of the process.
+    writeState: async (_room, doc) => { doc.flushToDisk?.(); },
+});
+
+// A read-only peer may watch and show up in presence, but must not write — and
+// now that the server persists rooms to the owner's tree, that's a file
+// integrity boundary, not a UI nicety, so it's enforced here rather than
+// trusted to the client (isReadFrame lives in ydoc.js).
+//
+// setupWSConnection only ever touches these members, so a small facade is
+// enough to filter — no need to fork it.
+function readOnlyConn(conn) {
+    conn.binaryType = "arraybuffer";
+    return {
+        binaryType: "arraybuffer",
+        get readyState() { return conn.readyState; },
+        send: (...args) => conn.send(...args),
+        ping: () => conn.ping(),
+        close: () => conn.close(),
+        on: (event, fn) =>
+            conn.on(event, event !== "message" ? fn : (m) => { if (isReadFrame(new Uint8Array(m))) fn(m); }),
+    };
+}
+
 const yws = new WebSocketServer({ noServer: true });
 server.on("upgrade", async (req, socket, head) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     if (!url.pathname.startsWith("/yjs/")) return; // not a collab socket
-    try {
-        await authenticate(url.searchParams.get("token"), url.searchParams.get("address"));
-    } catch {
-        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-        return socket.destroy();
-    }
-    // Room = the URL path after /yjs/ (an opaque key; peers agree on it).
-    const docName = url.pathname.slice("/yjs/".length);
-    yws.handleUpgrade(req, socket, head, (conn) => setupWSConnection(conn, req, { docName }));
+    const deny = (line) => { socket.write(`HTTP/1.1 ${line}\r\n\r\n`); socket.destroy(); };
+
+    let address;
+    try { address = await authenticate(url.searchParams.get("token"), url.searchParams.get("address")); }
+    catch { return deny("401 Unauthorized"); }
+
+    const docName = decodeURIComponent(url.pathname.slice("/yjs/".length));
+    const target = roomFile(docName);
+    if (!target) return deny("404 Not Found");
+
+    // Anyone with the link can watch a public namespace live; only the owner and
+    // the collaborators they named may type into it.
+    const writer = canEdit({ owner: target.owner, namespace: target.namespace }, address);
+    yws.handleUpgrade(req, socket, head, (conn) =>
+        setupWSConnection(writer ? conn : readOnlyConn(conn), req, { docName }));
 });
 
 server.listen(PORT, () => {
