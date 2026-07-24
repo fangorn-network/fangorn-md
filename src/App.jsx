@@ -234,6 +234,8 @@ export default function App({ address, onLogout }) {
     const [nudges, setNudges] = useState({}); // namespace → last on-chain NamespaceChange
     const [status, setStatus] = useState(null); // { kind: ok|err|busy, text, tx? }
     const [showCollabs, setShowCollabs] = useState(false);
+    // Off-canvas sidebar; only ever visible on narrow screens (see styles.css).
+    const [navOpen, setNavOpen] = useState(false);
     // An incoming share link (?owner=&ns=&note=) — parsed once on mount.
     const [share, setShare] = useState(() => {
         const p = new URLSearchParams(window.location.search);
@@ -257,6 +259,7 @@ export default function App({ address, onLogout }) {
         setActive(path);
         setContent(note.content);
         setSaveState("saved");
+        setNavOpen(false); // on mobile the drawer covers the note you just picked
     }, []);
 
     // Load the active repo's pointer + notes and open its index (or first note).
@@ -528,13 +531,23 @@ export default function App({ address, onLogout }) {
 
     return (
         <div className="app">
-            <aside className="sidebar">
+            <aside className={`sidebar${navOpen ? " open" : ""}`}>
                 <div className="sidebar-head">
                     <span className="brand">🌲 fangornmd</span>
                     <button className="btn small" onClick={newNote} title="New note">＋</button>
                 </div>
-                <div className="account-bar" title={address}>
-                    <span className="account-addr">{address ? short(address) : "no wallet"}</span>
+                <div className="account-bar">
+                    <button
+                        className="account-addr"
+                        title={address ? `${address} — click to copy` : "no wallet"}
+                        disabled={!address}
+                        onClick={() => {
+                            navigator.clipboard?.writeText(address);
+                            setStatus({ kind: "ok", text: "wallet address copied" });
+                        }}
+                    >
+                        {address ? short(address) : "no wallet"}
+                    </button>
                     <button className="btn ghost small" onClick={onLogout} title="Log out">log out</button>
                 </div>
                 <RepoBar
@@ -585,6 +598,7 @@ export default function App({ address, onLogout }) {
                     </footer>
                 )}
             </aside>
+            {navOpen && <div className="nav-backdrop" onClick={() => setNavOpen(false)} />}
 
             <main className="main">
                 {share && (
@@ -604,6 +618,14 @@ export default function App({ address, onLogout }) {
                     </div>
                 )}
                 <header className="topbar">
+                    <button
+                        className="btn ghost nav-toggle"
+                        onClick={() => setNavOpen((v) => !v)}
+                        aria-label="Notes"
+                        aria-expanded={navOpen}
+                    >
+                        ☰
+                    </button>
                     <span className="doc-title">{activeTitle ?? "—"}</span>
                     {/* Public notes live in the shared room — the server persists
                         them, so there's no local save state to report. */}
