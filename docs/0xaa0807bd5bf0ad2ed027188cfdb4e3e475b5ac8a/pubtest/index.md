@@ -13,5 +13,7 @@ const x = 2;
 const y = x*x;
 ```
 
-### CRDT based collab should work?
+### CRDT based collab should work? 
+actually it doesn't work yet :( 
+But I can add things here and they will get synced across to peers when I publish at least.
 

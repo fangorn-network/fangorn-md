@@ -1,6 +1,11 @@
 [
   {
     "path": "index.md",
-    "children": []
+    "children": [
+      {
+        "path": "Hello.md",
+        "children": []
+      }
+    ]
   }
 ]
