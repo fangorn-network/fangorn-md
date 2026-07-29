@@ -1,4 +1,8 @@
-# note 1
+# note
 
+```
+  /\_/\  
+ ( o.o ) 
+  > ^ <  
+```
 
-this is a note!!!!!1adfa 
