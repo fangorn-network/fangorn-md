@@ -116,10 +116,10 @@ function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow }) {
     return (
         <div className="repo-bar">
             <div className="repo-bar-head">
-                <span className="repo-bar-label">your namespaces</span>
+                <span className="repo-bar-label">your data</span>
                 <span className="repo-bar-actions">
-                    <button className="btn ghost small" title="New namespace" onClick={() => setForm(form === "new" ? null : "new")}>＋</button>
-                    <button className="btn ghost small" title="Subscribe to a namespace" onClick={() => setForm(form === "follow" ? null : "follow")}>⌕</button>
+                    <button className="btn ghost small" title="New — create a space for your notes" onClick={() => setForm(form === "new" ? null : "new")}>＋</button>
+                    <button className="btn ghost small" title="Subscribe to someone else's space" onClick={() => setForm(form === "follow" ? null : "follow")}>⌕</button>
                 </span>
             </div>
             <div className="repo-switch">
@@ -139,7 +139,7 @@ function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow }) {
             </div>
             {form === "new" && (
                 <form className="repo-form" onSubmit={submitNew}>
-                    <input className="repo-input" placeholder="namespace (e.g. images)" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+                    <input className="repo-input" placeholder="name it (e.g. My Recipes)" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
                     <select className="repo-input" value={visibility} onChange={(e) => setVisibility(e.target.value)}>
                         <option value="public">public</option>
                         <option value="private">private (encrypted)</option>
@@ -149,7 +149,7 @@ function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow }) {
             )}
             {form === "follow" && (
                 <form className="repo-form" onSubmit={submitFollow}>
-                    <input className="repo-input" placeholder="paste a share link or owner/namespace" value={ref} onChange={(e) => setRef(e.target.value)} autoFocus />
+                    <input className="repo-input" placeholder="paste a share link or owner/name" value={ref} onChange={(e) => setRef(e.target.value)} autoFocus />
                     <button className="btn small primary" type="submit">Subscribe</button>
                 </form>
             )}

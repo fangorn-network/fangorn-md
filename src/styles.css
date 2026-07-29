@@ -294,6 +294,18 @@ body {
     border-radius: 4px;
     padding: 0 3px;
 }
+/* ── pasted images ───────────────────────────────────── */
+/* Same shape as math: the ![](…) source stays in the DOM, zero-width, and the
+   image renders beside it. Inline-block for the same caret reason. */
+.md-img-render {
+    display: inline-block;
+    max-width: 100%;
+    max-height: 60vh;
+    border-radius: 6px;
+    margin: 0.3em 0;
+    user-select: none;
+}
+
 /* KaTeX ships its own error colour; keep it legible on the dark panel. */
 .katex-error { color: var(--danger) !important; }
 

@@ -3,9 +3,7 @@ import {
     readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, watch, rmSync, renameSync,
 } from "node:fs";
 import { join, extname, normalize } from "node:path";
-import { Fangorn, FangornConfig, extractMarkdownLinks } from "@fangorn-network/sdk";
-import { createPublicClient, http, encodeFunctionData, toHex } from "viem";
-import { CID } from "multiformats/cid";
+import { Fangorn, FangornConfig, appId, extractMarkdownLinks } from "@fangorn-network/sdk";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { WebSocketServer } from "ws";
 import { setupWSConnection, setPersistence, docs as yRooms } from "@y/websocket-server/utils";
@@ -31,7 +29,7 @@ const DATA_DIR = process.env.DATA_DIR ?? ROOT;
 const USERS_DIR = join(DATA_DIR, ".fangorn", "users");
 const PRIVY_APP_ID = process.env.PRIVY_APP_ID ?? process.env.VITE_PRIVY_APP_ID;
 
-for (const key of ["ETH_PRIVATE_KEY", "PINATA_JWT", "PINATA_GATEWAY"]) {
+for (const key of ["ETH_PRIVATE_KEY"]) {
     if (!process.env[key]) {
         console.error(`Missing ${key} — copy .env.example to .env and fill it in.`);
         process.exit(1);
@@ -42,28 +40,45 @@ if (!PRIVY_APP_ID) {
     process.exit(1);
 }
 
+// Namespaces are hierarchical — `app:publisher:namespace` — and fangornmd owns
+// the `fangornmd` app prefix. Every wiki published through this server lives
+// under it, which is what lets one subscription see the whole instance rather
+// than a per-publisher fan-out. The app id must be claimed on-chain once (see
+// the startup check below); publishers register separately, for the right to
+// write at all.
+const APP_ID = appId("fangornmd");
+const CONFIG = { ...FangornConfig, appId: APP_ID };
+
 const fangorn = Fangorn.create({
-    privateKey: process.env.ETH_PRIVATE_KEY, // service key: engine construction + Pinata only
-    storage: { pinata: { jwt: process.env.PINATA_JWT, gateway: process.env.PINATA_GATEWAY } },
+    privateKey: process.env.ETH_PRIVATE_KEY,
+    // storage: { pinata: { jwt: process.env.PINATA_JWT, gateway: process.env.PINATA_GATEWAY } },
+    storage: { signedUrl: {
+        workerUrl: 'https://sepolia.storage-worker.fangorn.network',
+        gateway: process.env.PINATA_GATEWAY,
+    } },
     domain: "localhost",
-    config: FangornConfig,
+    config: CONFIG,
 });
 
-// Direct chain reads (current root) + the one tx the browser will sign.
-const REGISTRY = FangornConfig.dataRegistryContractAddress;
-const CHAIN = FangornConfig.chain;
-const ZERO_BYTES32 = `0x${"0".repeat(64)}`;
-const publicClient = createPublicClient({ chain: CHAIN, transport: http(FangornConfig.rpcUrl) });
-const REGISTRY_ABI = [
-    { type: "function", name: "getNamespaceHead", stateMutability: "view", inputs: [{ name: "publisher", type: "address" }], outputs: [{ type: "bytes32" }] },
-    { type: "function", name: "commitStateRoot", stateMutability: "nonpayable", inputs: [{ name: "old_root", type: "bytes32" }, { name: "new_root", type: "bytes32" }], outputs: [] },
-];
-
-const readNamespaceHead = (owner) =>
-    publicClient.readContract({ address: REGISTRY, abi: REGISTRY_ABI, functionName: "getNamespaceHead", args: [owner] });
-// The on-chain root hex is exactly the commit CID's multihash digest (see the
-// SDK's pushCommit) — so a settlement tx is commitStateRoot(currentRoot, newRoot).
-const rootHexFromCid = (cid) => `0x${Buffer.from(CID.parse(cid).multihash.digest).toString("hex")}`;
+/**
+ * The app prefix must exist on-chain before anyone can publish under it —
+ * `commitStateRoot` reverts with AppNotFound otherwise. Checking at boot turns
+ * that into one clear line at startup instead of a failed publish for the first
+ * user who tries.
+ */
+async function assertAppRegistered() {
+    const owner = await fangorn.getDataRegistry().getAppOwner();
+    if (owner === `0x${"0".repeat(40)}`) {
+        console.error(
+            `App "fangornmd" (${APP_ID}) is not registered on-chain — publishing will fail.\n` +
+            `Claim it once from any funded wallet:\n` +
+            `  cast send ${CONFIG.dataRegistryContractAddress} "registerApp(bytes32)" ${APP_ID} \\\n` +
+            `    --rpc-url ${CONFIG.rpcUrl} --private-key <key>`,
+        );
+        process.exit(1);
+    }
+    return owner;
+}
 
 // ─── Auth (Privy) ───────────────────────────────────────────────────────────
 //
@@ -199,7 +214,17 @@ const renameInTree = (tree, from, to) =>
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const NOTE_PATH = /^[\w][\w .-]*\.md$/;
-const NAMESPACE = /^[\w][\w.-]{0,63}$/;
+// A namespace is a display name people type, but it's also a directory name and
+// a segment of the `owner:namespace:note` room key — so the rule is a blacklist
+// of what would break those, not a whitelist of safe characters.
+const NAMESPACE = {
+    test: (ns) =>
+        typeof ns === "string" &&
+        ns.length > 0 && ns.length <= 64 &&
+        ns === ns.trim() &&
+        !/[/\\:\x00-\x1f]/.test(ns) &&
+        ns !== "." && ns !== "..",
+};
 function assertNotePath(path) {
     if (!NOTE_PATH.test(path)) throw new HttpError(400, `invalid note path: ${path}`);
 }
@@ -250,43 +275,15 @@ function decodeVertex(v) {
     return { ...v, payload: { ...p, content: "🔒 (encrypted — opens in the owner's browser)" } };
 }
 
-// Reading a namespace walks the pail tree from the owner's on-chain root — many
-// sequential gateway fetches. Cache per (owner, namespace) keyed by the tip.
-//
-// LRU-bounded so it can't grow without limit (one always-on process, every
-// distinct namespace ever touched used to stick forever). A plain Map keeps
-// insertion order, so promote-on-read (delete+re-set) puts hot keys last and we
-// evict the oldest (first) once over the cap. The durable copy is on-chain, so
-// an evicted entry just re-walks on next access.
-// ponytail: fixed entry count, not byte-aware; switch to a size budget if a few
-// huge namespaces blow memory before the count cap bites.
-const REMOTE_CACHE_MAX = 256;
-const remoteCache = new Map();
 const cacheKey = (repo) => `${repo.owner}/${repo.namespace}`;
-const cacheGet = (key) => {
-    const v = remoteCache.get(key);
-    if (v) { remoteCache.delete(key); remoteCache.set(key, v); } // promote to MRU
-    return v;
-};
-const cacheSet = (key, v) => {
-    remoteCache.delete(key);
-    remoteCache.set(key, v);
-    if (remoteCache.size > REMOTE_CACHE_MAX) remoteCache.delete(remoteCache.keys().next().value);
-};
 
+// `readNamespace` is the SDK's tip-keyed, LRU-bounded read: walking the pail
+// tree is many sequential gateway fetches, and the tip only moves on publish,
+// so there's nothing to invalidate here after a settle or a remote change.
 async function remoteState(repo) {
-    const key = cacheKey(repo);
-    const tip = await fangorn.onChainTip(repo.owner);
-    let cached = cacheGet(key);
-    if (!cached || cached.tip !== tip) {
-        const started = Date.now();
-        const raw = await fangorn.engine.listNamespace(repo.namespace, repo.owner);
-        const contents = { ...raw, vertices: raw.vertices.map(decodeVertex) };
-        cached = { tip, contents };
-        cacheSet(key, cached);
-        console.log(`[remote:${key}] walked ${contents.vertices.length} vertices / ${contents.edges.length} edges in ${((Date.now() - started) / 1000).toFixed(1)}s`);
-    }
-    return { tip, contents: cached.contents, latest: latestByPath(cached.contents) };
+    const { tip, contents: raw } = await fangorn.readNamespace(repo.owner, repo.namespace);
+    const contents = { ...raw, vertices: raw.vertices.map(decodeVertex) };
+    return { tip, contents, latest: latestByPath(contents) };
 }
 
 // ─── Live events (SSE) ────────────────────────────────────────────────────────
@@ -295,6 +292,12 @@ async function remoteState(repo) {
 // connection watches only its own user: local-change (their working tree) and
 // remote-change (each tracked repo's on-chain updates). Repos added after
 // connect are picked up on the next reconnect.
+//
+// Remote changes come off ONE app-wide subscription shared by every connection
+// (`fangorn.appFeed()`), not one watch per connection × per tracked repo. Since
+// fangornmd owns the `fangornmd` app prefix, every wiki this server serves is
+// already in that single topic filter — each connection just picks out the
+// repos it tracks.
 
 async function handleEvents(req, res, url) {
     let address;
@@ -320,28 +323,23 @@ async function handleEvents(req, res, url) {
         return watch(dir, { recursive: true }, onLocal);
     });
 
-    const aborts = [];
-    for (const repo of repos) {
-        const abort = new AbortController();
-        aborts.push(abort);
-        (async () => {
-            try {
-                for await (const change of fangorn.subscribe({ namespace: repo.namespace, owner: repo.owner, signal: abort.signal })) {
-                    remoteCache.delete(cacheKey(repo));
-                    write("remote-change", { ...change, namespace: repo.namespace });
-                }
-            } catch (err) {
-                if (!abort.signal.aborted) console.error(`subscribe(${cacheKey(repo)}) failed:`, err.message);
-            }
-        })();
-    }
+    const tracked = new Set(repos.map(cacheKey));
+    const offFeed = fangorn.appFeed().on(
+        (change) => {
+            // The event carries a checksummed address; repo owners are stored
+            // lowercase.
+            if (tracked.has(cacheKey({ owner: change.owner.toLowerCase(), namespace: change.namespace })))
+                write("remote-change", change);
+        },
+        (err) => console.error(`app feed (${address}):`, err.message),
+    );
 
     const heartbeat = setInterval(() => res.write(": ping\n\n"), 25_000);
     req.on("close", () => {
         clearInterval(heartbeat);
         clearTimeout(debounce);
         for (const w of localWatchers) w.close();
-        for (const a of aborts) a.abort();
+        offFeed();
     });
 }
 
@@ -366,7 +364,7 @@ const routes = {
     // by its first publish (which parents on the user's current root).
     "POST /api/repos": async ({ address, body }) => {
         const namespace = String(body.namespace ?? "").trim();
-        if (!NAMESPACE.test(namespace)) throw new HttpError(400, "invalid namespace");
+        if (!NAMESPACE.test(namespace)) throw new HttpError(400, "invalid name — 1-64 characters, no / \\ or :");
         const s = userStore(address);
         if (s.read().repos[namespace]) throw new HttpError(409, `already tracking ${namespace}`);
         const visibility = body.visibility === "private" ? "private" : "public";
@@ -383,11 +381,11 @@ const routes = {
     "POST /api/repos/follow": async ({ address, body }) => {
         const namespace = String(body.namespace ?? "").trim();
         const owner = String(body.owner ?? "").trim().toLowerCase();
-        if (!NAMESPACE.test(namespace)) throw new HttpError(400, "invalid namespace");
+        if (!NAMESPACE.test(namespace)) throw new HttpError(400, "invalid name — 1-64 characters, no / \\ or :");
         if (!/^0x[0-9a-f]{40}$/.test(owner)) throw new HttpError(400, "invalid owner address");
         const s = userStore(address);
         if (s.read().repos[namespace]) throw new HttpError(409, `already tracking ${namespace}`);
-        const tip = await fangorn.onChainTip(owner).catch(() => null);
+        const tip = await fangorn.onChainTip(owner, namespace).catch(() => null);
         const dir = relDir(address, namespace);
         mkdirSync(join(DATA_DIR, dir), { recursive: true });
         s.add({ namespace, owner, head: tip ?? null, visibility: "public", dir });
@@ -528,8 +526,6 @@ const routes = {
         flushRooms(repo.owner, repo.namespace);
 
         const t0 = Date.now();
-        const oldRoot = await readNamespaceHead(address);
-        const parent = oldRoot === ZERO_BYTES32 ? undefined : fangorn.engine.commitCidFromRootHex(oldRoot);
         const { latest } = await remoteState(repo);
         // Persist the reconciled tree so it publishes as a vertex (exact
         // hierarchy for followers), and derive the graph's edges from it.
@@ -555,43 +551,31 @@ const routes = {
             }
         }
 
-        const commit = await fangorn.commit({
-            namespace: repo.namespace,
-            vertices: graph.vertices,
-            edges: graph.edges,
-            parent,
-            message: body.message || "update wiki",
-        });
-        const data = encodeFunctionData({ abi: REGISTRY_ABI, functionName: "commitStateRoot", args: [oldRoot, rootHexFromCid(commit.commitCid)] });
-        // Wallet fee estimation runs too tight for Arbitrum Sepolia's live base
-        // fee — quote fees ourselves with headroom. maxFeePerGas is only a
-        // ceiling (you pay baseFee+priority), so 2× is safe, not overpaying.
-        const { maxFeePerGas, maxPriorityFeePerGas } = await publicClient.estimateFeesPerGas();
-        // Estimate the gas limit here too, so the wallet never has to run its own
-        // eth_estimateGas — that call against the public Arbitrum Sepolia RPC is
-        // what surfaces as "Network fee Unavailable" in MetaMask. Simulating here
-        // also turns a would-be revert (e.g. a stale root) into a clear error
-        // instead of a cryptic wallet message. 1.5× headroom; gas is only a
-        // ceiling, so overshooting costs nothing. Fallback keeps publish working
-        // if the RPC hiccups on this one call.
-        let gas;
+        // Builds the commit on the namespace's current on-chain head, pins it, and
+        // returns the UNSIGNED settlement tx (fees and gas already quoted with
+        // headroom, and a would-be revert surfaced here rather than in the
+        // wallet). The server never signs — the head moves only when the owner's
+        // browser wallet sends this.
+        let prepared;
         try {
-            const estimate = await publicClient.estimateGas({ account: address, to: REGISTRY, data });
-            gas = (estimate * 3n) / 2n;
+            prepared = await fangorn.prepareCommit({
+                owner: address,
+                namespace: repo.namespace,
+                vertices: graph.vertices,
+                edges: graph.edges,
+                message: body.message || "update wiki",
+            });
         } catch (err) {
-            if (/revert/i.test(err.message)) throw new HttpError(409, `settlement would revert (root moved on-chain?) — pull and retry: ${err.shortMessage ?? err.message}`);
-            gas = 5_000_000n; // RPC hiccup, not a revert — proceed with a safe ceiling
+            if (/revert/i.test(err.message)) throw new HttpError(409, `settlement would revert (root moved on-chain?) — pull and retry: ${err.message}`);
+            throw err;
         }
-        console.log(`[prepare:${cacheKey(repo)}] commit+flush ${((Date.now() - t0) / 1000).toFixed(1)}s → ${commit.commitCid}`);
+
+        console.log(`[prepare:${cacheKey(repo)}] commit+flush ${((Date.now() - t0) / 1000).toFixed(1)}s → ${prepared.commitCid}`);
         return {
             namespace: repo.namespace,
-            commitCid: commit.commitCid,
-            staged: { vertices: graph.vertices.length, edges: graph.edges.length },
-            tx: {
-                to: REGISTRY, data, chainId: CHAIN.id, gas: toHex(gas),
-                maxFeePerGas: toHex(maxFeePerGas * 2n),
-                maxPriorityFeePerGas: toHex(maxPriorityFeePerGas),
-            },
+            commitCid: prepared.commitCid,
+            staged: prepared.staged,
+            tx: prepared.tx,
         };
     },
 
@@ -601,7 +585,6 @@ const routes = {
         const repo = userStore(address).get(namespace);
         if (repo.owner !== address) throw new HttpError(403, "not your repo");
         userStore(address).setHead(namespace, String(body.commitCid ?? ""));
-        remoteCache.delete(cacheKey(repo));
         return { ok: true, head: body.commitCid ?? null, txHash: body.txHash ?? null };
     },
 
@@ -781,10 +764,13 @@ server.on("upgrade", async (req, socket, head) => {
         setupWSConnection(writer ? conn : readOnlyConn(conn), req, { docName }));
 });
 
+const appOwner = await assertAppRegistered();
+
 server.listen(PORT, () => {
     mkdirSync(USERS_DIR, { recursive: true });
     console.log(`fangornmd server → http://localhost:${PORT}`);
     console.log(`  mode:    multi-tenant relay (self-custodial — holds no user keys)`);
     console.log(`  service: ${fangorn.getAddress()} (engine + Pinata only)`);
+    console.log(`  app:     fangornmd ${APP_ID} (owner ${appOwner})`);
     console.log(`  privy:   ${PRIVY_APP_ID}`);
 });

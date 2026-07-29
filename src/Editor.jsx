@@ -65,8 +65,13 @@ const buildDecorate = (editor, activeBlock) => ([node, path]) => {
         push(i, e, { link: true, href: `${m[1].trim()}.md` });
         syn(i, i + 2); syn(i + 2 + m[1].length, e);
     });
-    // [text](url) → show text, hide "[" and "](url)"
-    scan(/\[([^\]]+?)\]\(([^)\s]+?)\)/g, (m) => {
+    // ![alt](src) → the image itself, source collapsed (same trick as math)
+    scan(/!\[([^\]]*)\]\(([^)\s]+?)\)/g, (m) => {
+        const i = m.index, e = i + m[0].length;
+        push(i, e, { image: m[2], alt: m[1], active: onActive });
+    });
+    // [text](url) → show text, hide "[" and "](url)"  (not the image form above)
+    scan(/(?<!!)\[([^\]]+?)\]\(([^)\s]+?)\)/g, (m) => {
         const i = m.index, e = i + m[0].length, textEnd = i + 1 + m[1].length;
         push(i, e, { link: true, href: m[2] });
         syn(i, i + 1); syn(textEnd, e);
@@ -109,6 +114,15 @@ function Leaf({ attributes, children, leaf }) {
                     contentEditable={false}
                     dangerouslySetInnerHTML={{ __html: renderMath(leaf.math, leaf.display) }}
                 />
+                <span className="md-syntax">{children}</span>
+            </span>
+        );
+    }
+    if (leaf.image !== undefined) {
+        if (leaf.active) return <span {...attributes} className="md-math-src">{children}</span>;
+        return (
+            <span {...attributes} className="md-img">
+                <img className="md-img-render" src={leaf.image} alt={leaf.alt} contentEditable={false} />
                 <span className="md-syntax">{children}</span>
             </span>
         );
@@ -215,6 +229,25 @@ function FormatBar({ editor }) {
     );
 }
 
+// Pasted/dropped images go in as data-URI markdown. No upload endpoint, no
+// blob store, no extra file to publish: the note stays one self-contained .md,
+// so it survives publish → pull → CRDT sync unchanged.
+// ponytail: base64 inflates by 4/3 and lives in the note's text (and its Yjs
+// doc), so it's capped small — swap in an asset endpoint if people start
+// pasting photos rather than screenshots.
+const MAX_IMAGE_BYTES = 1_000_000;
+const insertImage = (editor, file) => {
+    if (file.size > MAX_IMAGE_BYTES) {
+        alert(`That image is ${Math.round(file.size / 1e5) / 10} MB — images have to be under 1 MB.`);
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => Transforms.insertText(editor, `![](${reader.result})`);
+    reader.readAsDataURL(file);
+};
+const imageFrom = (dataTransfer) =>
+    [...(dataTransfer?.files ?? [])].find((f) => f.type.startsWith("image/"));
+
 // The single editing surface. Both editors below hand it a ready `editor`.
 // Ctrl/⌘-click a rendered link to follow it (plain click just edits).
 function MarkdownSlate({ editor, initialValue, onSlateChange, onNavigate, readOnly }) {
@@ -228,6 +261,12 @@ function MarkdownSlate({ editor, initialValue, onSlateChange, onNavigate, readOn
     const handleClick = (e) => {
         const el = e.target.closest?.("[data-href]");
         if (el && (e.metaKey || e.ctrlKey)) { e.preventDefault(); onNavigate(el.getAttribute("data-href")); }
+    };
+    const handleImage = (e) => {
+        const file = imageFrom(e.clipboardData ?? e.dataTransfer);
+        if (!file || readOnly) return; // let Slate handle text as usual
+        e.preventDefault();
+        insertImage(editor, file);
     };
     const handleKeyDown = (e) => {
         // Enter on an unterminated ``` opens the block instead of turning the
@@ -259,6 +298,9 @@ function MarkdownSlate({ editor, initialValue, onSlateChange, onNavigate, readOn
                     renderLeaf={useCallback((props) => <Leaf {...props} />, [])}
                     onClick={handleClick}
                     onKeyDown={handleKeyDown}
+                    // preventDefault is how Slate is told the event is handled.
+                    onPaste={handleImage}
+                    onDrop={handleImage}
                     spellCheck={false}
                     placeholder="Write here… markdown renders as you type"
                 />
