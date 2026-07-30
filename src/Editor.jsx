@@ -1,11 +1,11 @@
-import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createEditor, Editor as SEditor, Node, Text, Transforms } from "slate";
 import { Slate, Editable, withReact, ReactEditor } from "slate-react";
 import { withHistory } from "slate-history";
-import katex from "katex";
 import "katex/dist/katex.min.css";
 import { findMath } from "./mdmath.js";
 import { fenceLines } from "./mdfence.js";
+import { renderMarkdown, renderMath } from "./render.js";
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import { withYjs, withYHistory, YjsEditor } from "@slate-yjs/core";
@@ -84,22 +84,6 @@ const buildDecorate = (editor, activeBlock) => ([node, path]) => {
 
 const HEADING_SIZE = { 1: "1.7em", 2: "1.45em", 3: "1.25em", 4: "1.1em", 5: "1em", 6: "1em" };
 
-// decorate() re-runs on every keystroke, so memoise the KaTeX HTML by source.
-// ponytail: crude clear-at-cap instead of an LRU — a note holds tens of formulas,
-// not thousands; swap in the LRU pattern if that ever stops being true.
-const mathCache = new Map();
-const renderMath = (tex, display) => {
-    const key = `${display ? "d" : "i"}:${tex}`;
-    let html = mathCache.get(key);
-    if (html === undefined) {
-        // throwOnError:false → KaTeX renders bad input as red source, never throws.
-        html = katex.renderToString(tex, { throwOnError: false, displayMode: !!display });
-        if (mathCache.size > 500) mathCache.clear();
-        mathCache.set(key, html);
-    }
-    return html;
-};
-
 function Leaf({ attributes, children, leaf }) {
     // Math renders as KaTeX when the caret is on another line, and falls back to
     // the raw $…$ source when you're editing that line. The source text always
@@ -140,6 +124,10 @@ function Leaf({ attributes, children, leaf }) {
     if (leaf.link) return <span {...attributes} className="md-link" data-href={leaf.href}>{children}</span>;
     return <span {...attributes} style={style}>{children}</span>;
 }
+
+// Stable by construction — nothing to close over, so no hook and no chance of
+// it being called from inside a conditional branch of the JSX.
+const renderLeaf = (props) => <Leaf {...props} />;
 
 // Full-width code-block chrome belongs on the block, not the leaves — a leaf
 // background only paints as wide as its text. The ``` lines themselves collapse
@@ -248,10 +236,66 @@ const insertImage = (editor, file) => {
 const imageFrom = (dataTransfer) =>
     [...(dataTransfer?.files ?? [])].find((f) => f.type.startsWith("image/"));
 
+// ── read pane ─────────────────────────────────────────────────────
+// The rendered half of the split. In the editor a link is always source under
+// the caret, so this is where one is finally just a link: a plain click on a
+// note link navigates, external links open in a tab. Same markdown, no caret.
+function DocView({ md, onNavigate, paneRef, onScroll }) {
+    const html = useMemo(() => renderMarkdown(md), [md]);
+    const handleClick = (e) => {
+        const a = e.target.closest?.("a[data-note]");
+        if (!a) return;
+        e.preventDefault();
+        onNavigate(a.getAttribute("data-note"));
+    };
+    return (
+        <div className="doc-view" ref={paneRef} onScroll={onScroll}>
+            {/* The HTML is built by render.js, which escapes every byte of the
+                note — the only tags here are the ones it writes itself. */}
+            <article className="doc-render" onClick={handleClick} dangerouslySetInnerHTML={{ __html: html }} />
+        </div>
+    );
+}
+
 // The single editing surface. Both editors below hand it a ready `editor`.
 // Ctrl/⌘-click a rendered link to follow it (plain click just edits).
-function MarkdownSlate({ editor, initialValue, onSlateChange, onNavigate, readOnly }) {
+// `view` is "edit" | "split" | "read"; the read pane renders `previewText`,
+// which the owner of that state keeps current from onText below.
+// A collapsed pane leaves a rail behind rather than vanishing, so the way back
+// is where the pane was — no hunting for the control that hid it.
+const Rail = ({ side, label, onExpand }) => (
+    <button className={`pane-rail ${side}`} onClick={onExpand} title={`Show the ${label}`}>
+        <span className="pane-rail-chev">{side === "left" ? "›" : "‹"}</span>
+        <span className="pane-rail-label">{label}</span>
+    </button>
+);
+
+function MarkdownSlate({
+    editor, initialValue, onSlateChange, onNavigate, readOnly,
+    view = "edit", onViewChange, previewText = "",
+}) {
     const [activeBlock, setActiveBlock] = useState(-1);
+    const editPane = useRef(null);
+    const readPane = useRef(null);
+    const locked = useRef(false);
+
+    // Proportional scroll sync for the split. The panes have different heights
+    // (rendered markdown is shorter than its source), so match the fraction
+    // scrolled rather than the pixels, and lock for a frame so the pane we just
+    // moved doesn't echo the scroll back.
+    const syncScroll = (fromRef, toRef) => () => {
+        const from = fromRef.current, to = toRef.current;
+        if (view !== "split" || !from || !to || locked.current) return;
+        locked.current = true;
+        const room = from.scrollHeight - from.clientHeight;
+        to.scrollTop = room > 0 ? (from.scrollTop / room) * (to.scrollHeight - to.clientHeight) : 0;
+        requestAnimationFrame(() => { locked.current = false; });
+    };
+
+    // renderLeaf lives at module scope (below): it closes over nothing, so it's
+    // already stable, and a hook inside the `view !== "read"` branch of the JSX
+    // was a hook that stopped being called when you switched to Read — fewer
+    // hooks than the previous render, which React throws on. Blank screen.
     const decorate = useCallback(buildDecorate(editor, activeBlock), [editor, activeBlock]);
     const renderElement = useCallback(buildRenderElement(editor, activeBlock), [editor, activeBlock]);
     const handleChange = () => {
@@ -288,29 +332,53 @@ function MarkdownSlate({ editor, initialValue, onSlateChange, onNavigate, readOn
     };
     return (
         <Slate editor={editor} initialValue={initialValue} onChange={handleChange}>
-            {!readOnly && <FormatBar editor={editor} />}
-            <div className="editor">
-                <Editable
-                    className="editor-input"
-                    readOnly={readOnly}
-                    decorate={decorate}
-                    renderElement={renderElement}
-                    renderLeaf={useCallback((props) => <Leaf {...props} />, [])}
-                    onClick={handleClick}
-                    onKeyDown={handleKeyDown}
-                    // preventDefault is how Slate is told the event is handled.
-                    onPaste={handleImage}
-                    onDrop={handleImage}
-                    spellCheck={false}
-                    placeholder="Write here… markdown renders as you type"
-                />
+            {!readOnly && view !== "read" && <FormatBar editor={editor} />}
+            <div className={`panes ${view}`}>
+                {view === "read" && onViewChange && (
+                    <Rail side="left" label="markdown" onExpand={() => onViewChange("split")} />
+                )}
+                {view !== "read" && (
+                    <div className="editor" ref={editPane} onScroll={syncScroll(editPane, readPane)}>
+                        <Editable
+                            className="editor-input"
+                            readOnly={readOnly}
+                            decorate={decorate}
+                            renderElement={renderElement}
+                            renderLeaf={renderLeaf}
+                            onClick={handleClick}
+                            onKeyDown={handleKeyDown}
+                            // preventDefault is how Slate is told the event is handled.
+                            onPaste={handleImage}
+                            onDrop={handleImage}
+                            spellCheck={false}
+                            placeholder="Write here… markdown renders as you type"
+                        />
+                    </div>
+                )}
+                {view === "split" && onViewChange && (
+                    <div className="pane-divider">
+                        <button className="pane-collapse" title="Hide the markdown" onClick={() => onViewChange("read")}>‹</button>
+                        <button className="pane-collapse" title="Hide the document" onClick={() => onViewChange("edit")}>›</button>
+                    </div>
+                )}
+                {view !== "edit" && (
+                    <DocView
+                        md={previewText}
+                        onNavigate={onNavigate}
+                        paneRef={readPane}
+                        onScroll={syncScroll(readPane, editPane)}
+                    />
+                )}
+                {view === "edit" && onViewChange && (
+                    <Rail side="right" label="document" onExpand={() => onViewChange("split")} />
+                )}
             </div>
         </Slate>
     );
 }
 
 // ── Solo editor (private repos / offline) ─────────────────────────
-export default function Editor({ content, onChange, onNavigate, noteKey, readOnly }) {
+export default function Editor({ content, onChange, onNavigate, noteKey, readOnly, view, onViewChange }) {
     // A fresh editor per note is the documented multi-document pattern: it
     // resets history and selection cleanly on switch.
     const editor = useMemo(() => withHistory(withReact(createEditor())), [noteKey]);
@@ -338,6 +406,11 @@ export default function Editor({ content, onChange, onNavigate, noteKey, readOnl
             onSlateChange={onSlateChange}
             onNavigate={onNavigate}
             readOnly={readOnly}
+            view={view}
+            onViewChange={onViewChange}
+            // Solo notes already lift every keystroke to App (that's the
+            // autosave), so `content` is the live text — no second channel.
+            previewText={content}
         />
     );
 }
@@ -359,7 +432,10 @@ const PLACEHOLDER = [{ type: "paragraph", children: [{ text: "" }] }];
 const colorFor = (addr) => `hsl(${[...(addr ?? "")].reduce((a, c) => a + c.charCodeAt(0), 0) % 360} 60% 45%)`;
 const short = (s) => (s ? `${s.slice(0, 6)}…${s.slice(-4)}` : "");
 
-export function CollabEditor({ owner, namespace, note, onNavigate, address, getToken, readOnly }) {
+export function CollabEditor({
+    owner, namespace, note, onNavigate, address, getToken, readOnly,
+    view, onViewChange, onText, previewText,
+}) {
     const room = `${owner}:${namespace}:${note}`;
     const [conn, setConn] = useState(null); // { provider, editor }
     const [peers, setPeers] = useState([]);
@@ -403,8 +479,11 @@ export function CollabEditor({ owner, namespace, note, onNavigate, address, getT
     useEffect(() => {
         if (!conn) return;
         YjsEditor.connect(conn.editor);
+        // Nothing is typed yet, but the room's text just landed — hand it up so
+        // the read pane and Export start from the document, not from blank.
+        onText?.(fromSlate(conn.editor.children));
         return () => YjsEditor.disconnect(conn.editor);
-    }, [conn]);
+    }, [conn]); // eslint-disable-line react-hooks/exhaustive-deps
 
     return (
         <div className="collab">
@@ -423,8 +502,15 @@ export function CollabEditor({ owner, namespace, note, onNavigate, address, getT
                 <MarkdownSlate
                     editor={conn.editor}
                     initialValue={PLACEHOLDER}
+                    // Collab notes are never saved from here (the server owns
+                    // the room), so this reports text purely so the read pane
+                    // and Export can see what everyone is typing.
+                    onSlateChange={() => onText?.(fromSlate(conn.editor.children))}
                     onNavigate={onNavigate}
                     readOnly={readOnly}
+                    view={view}
+                    onViewChange={onViewChange}
+                    previewText={previewText}
                 />
             ) : (
                 <div className="empty">connecting to the live session…</div>

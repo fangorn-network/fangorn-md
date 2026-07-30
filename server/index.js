@@ -2,14 +2,17 @@ import { createServer } from "node:http";
 import {
     readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, watch, rmSync, renameSync,
 } from "node:fs";
-import { join, extname, normalize } from "node:path";
+import { join, dirname, extname, normalize } from "node:path";
 import { Fangorn, FangornConfig, appId, extractMarkdownLinks } from "@fangorn-network/sdk";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { WebSocketServer } from "ws";
 import { setupWSConnection, setPersistence, docs as yRooms } from "@y/websocket-server/utils";
 import * as Y from "yjs";
-import { docMarkdown, seedFromMarkdown, isReadFrame } from "./ydoc.js";
+import { docMarkdown, seedFromMarkdown, isReadFrame, encodeRoomState, applyRoomState } from "./ydoc.js";
 import { buildWikiGraph, latestByPath, latestEdges } from "./graph.js";
+// Shared with the browser: one renderer for the pane, the export and the
+// published page, so a public URL can't drift from what the author saw.
+import { publicPage } from "../src/render.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 //
@@ -236,6 +239,12 @@ function sendJson(res, status, body) {
     res.end(JSON.stringify(body, bigintReplacer));
 }
 
+// The public route has readers, not API clients, on the other end.
+function sendText(res, status, body) {
+    res.writeHead(status, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end(body);
+}
+
 function readJson(req) {
     return new Promise((resolve, reject) => {
         let data = "";
@@ -457,6 +466,7 @@ const routes = {
         if (!canEdit(repo, address)) throw new HttpError(403, "read-only — ask the owner to add you as a collaborator");
         const file = join(docsDir(repo), path);
         if (!existsSync(file)) throw new HttpError(404, `no such note: ${path}`);
+        closeRoom(repo.owner, repo.namespace, path); // before the unlink, or the room writes it back
         rmSync(file);
         writeTree(repo, reconcileTree(repo).tree); // prune the now-missing node
         return { deleted: path };
@@ -473,6 +483,10 @@ const routes = {
         const dir = docsDir(repo);
         if (!existsSync(join(dir, path))) throw new HttpError(404, `no such note: ${path}`);
         if (existsSync(join(dir, to))) throw new HttpError(409, `already exists: ${to}`);
+        // The room is named after the note, so the old name's room is orphaned —
+        // close it first, or it flushes the note straight back to the old path.
+        // The new name seeds fresh from the file it's about to get.
+        closeRoom(repo.owner, repo.namespace, path);
         renameSync(join(dir, path), join(dir, to));
         writeTree(repo, renameInTree(reconcileTree(repo).tree, path, to));
         return { path: to };
@@ -597,6 +611,68 @@ const routes = {
     },
 };
 
+// ─── Public read (no auth) ──────────────────────────────────────────────────
+//
+// `/r/:owner/:namespace/:note.md` — the published snapshot of one note, served
+// to anyone with the link. No token, no wallet, no SPA shell: the HTML arrives
+// rendered, which is what makes it work for a stranger's browser, a link
+// preview, a crawler and an agent's fetch all at once. Those are the same
+// requirement, so they get the same route.
+//
+// `Accept: text/markdown` (or text/plain) returns the source instead. An agent
+// wants the markdown, and markdown is what's stored — no lossy conversion step
+// the way there'd be out of a proprietary document format.
+//
+// What's served is the last PUBLISHED version, read straight from the chain +
+// IPFS via `remoteState`, never the working tree: drafts stay private until
+// their author signs a publish. `decodeVertex` has already replaced any
+// encrypted payload with a placeholder, so ciphertext can't leak here either.
+const PUBLIC_PREFIX = "/r/";
+
+// Only namespaces this server knows AND that are marked public are served —
+// mirroring roomFile()'s rule. Anything else would make the box an open gateway
+// for the whole network, which is a different product decision than "my share
+// links work".
+function publicTarget(pathname) {
+    const [owner, ns, note = "index.md"] = pathname.slice(PUBLIC_PREFIX.length).split("/").map(decodeURIComponent);
+    if (!/^0x[0-9a-f]{40}$/i.test(owner ?? "")) return null;
+    if (!NAMESPACE.test(ns ?? "") || !NOTE_PATH.test(note)) return null;
+    const repo = readUserState(owner.toLowerCase()).repos?.[ns];
+    if (!repo || repo.visibility === "private") return null;
+    return { repo, owner: owner.toLowerCase(), ns, note };
+}
+
+async function servePublic(req, res, pathname) {
+    const target = publicTarget(pathname);
+    if (!target) return sendText(res, 404, "no such published note");
+
+    // /r/owner/ns → /r/owner/ns/index.md, so relative wikilinks resolve against
+    // a note path rather than the namespace.
+    if (pathname.slice(PUBLIC_PREFIX.length).split("/").length < 3) {
+        res.writeHead(302, { Location: `${pathname.replace(/\/$/, "")}/index.md` });
+        return res.end();
+    }
+
+    const { latest } = await remoteState(target.repo);
+    const v = latest.get(target.note);
+    if (!v) return sendText(res, 404, `not published yet: ${target.note}`);
+
+    const md = v.payload.content ?? "";
+    const wantsMarkdown = /text\/(markdown|plain)/.test(req.headers.accept ?? "");
+    // Cache on the CID: a published note is immutable, so a hit is always valid.
+    const headers = { "Cache-Control": "public, max-age=60", ETag: `"${v.cid}"` };
+    if (wantsMarkdown) {
+        res.writeHead(200, { ...headers, "Content-Type": "text/markdown; charset=utf-8" });
+        return res.end(md);
+    }
+    res.writeHead(200, { ...headers, "Content-Type": "text/html; charset=utf-8" });
+    res.end(publicPage(md, {
+        title: firstHeading(md, target.note.replace(/\.md$/, "")),
+        owner: target.owner, ns: target.ns, note: target.note,
+        cid: v.cid, updatedAt: v.payload.updatedAt,
+    }));
+}
+
 // ─── Static SPA (production) ────────────────────────────────────────────────
 
 const DIST = join(ROOT, "dist");
@@ -619,6 +695,12 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
     if (req.method === "GET" && url.pathname === "/api/events") return handleEvents(req, res, url);
+    if (req.method === "GET" && url.pathname.startsWith(PUBLIC_PREFIX)) {
+        // Unauthenticated and reaching the network — its own try//catch, so a
+        // gateway hiccup is a 502 rather than an unhandled rejection.
+        try { return await servePublic(req, res, url.pathname); }
+        catch (err) { console.error(err); return sendText(res, 502, "could not read the published namespace"); }
+    }
     if (req.method === "GET" && !url.pathname.startsWith("/api/")) return serveStatic(res, url.pathname);
 
     let key = `${req.method} ${url.pathname}`;
@@ -684,6 +766,45 @@ function roomFile(room) {
     return { owner, namespace, note, file: join(DATA_DIR, relDir(owner, namespace), note) };
 }
 
+// The room's CRDT state, kept beside the working tree so a room survives being
+// evicted (last peer left) or the process restarting. Without it, the next
+// visitor gets a room re-seeded from markdown with fresh identities, and a peer
+// that reconnects holding the old one merges the note into itself — the whole
+// body, twice. See the note in ydoc.js.
+const roomStateFile = ({ owner, namespace, note }) =>
+    join(DATA_DIR, ".fangorn", "rooms", owner, namespace, `${note}.json`);
+
+const readRoomState = (target) => {
+    try { return JSON.parse(readFileSync(roomStateFile(target), "utf-8")); }
+    catch { return null; } // never seen, or unreadable — either way, seed instead
+};
+
+// `md` is the text this snapshot decodes to. Restoring checks it against the
+// file, so a room only resumes while the file is still the one it came from.
+const writeRoomState = (target, doc, md) => {
+    const file = roomStateFile(target);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ md, update: encodeRoomState(doc) }), "utf-8");
+};
+
+// Retire a note's room: the snapshot AND the live doc, if anyone is still in
+// it. A room outlives the file it mirrors — its debounced flush, and the write
+// the last peer triggers on leaving, both re-create the file from memory. That
+// is how a rename left the old name sitting on disk beside the new one. So the
+// doc is disarmed and evicted before the file moves; the client reconnects to
+// the room named after the new file.
+const closeRoom = (owner, namespace, note) => {
+    const room = `${owner}:${namespace}:${note}`;
+    const doc = yRooms.get(room);
+    if (doc) {
+        doc.flushToDisk = undefined; // writeState on the last disconnect is now a no-op
+        yRooms.delete(room);
+        for (const conn of doc.conns.keys()) conn.close();
+        doc.destroy();
+    }
+    rmSync(roomStateFile({ owner, namespace, note }), { force: true });
+};
+
 const FLUSH_MS = 800;
 
 // Force every open room in a namespace to disk (used just before Publish reads
@@ -700,7 +821,20 @@ setPersistence({
         if (!target) return;
         const xml = doc.get("content", Y.XmlText);
         if (xml.length === 0 && existsSync(target.file)) {
-            seedFromMarkdown(xml, readFileSync(target.file, "utf-8"));
+            const md = readFileSync(target.file, "utf-8");
+            const saved = readRoomState(target);
+            // Resume the room where it left off, but only while its snapshot
+            // still decodes to what's on disk. Anything else means the file
+            // moved on underneath it (a pull, an external editor) and the file
+            // wins — which is the one case worth minting new identities for.
+            if (saved?.md === md) applyRoomState(doc, saved.update);
+            else {
+                seedFromMarkdown(xml, md);
+                // Snapshot the seed immediately: a peer can join, hold this
+                // exact state, and reconnect after an eviction without ever
+                // having typed a character.
+                writeRoomState(target, doc, md);
+            }
         }
         let timer = null;
         const flush = () => {
@@ -712,6 +846,7 @@ setPersistence({
             if (!existsSync(target.file)) { if (!md.trim()) return; }
             else if (readFileSync(target.file, "utf-8") === md) return;
             writeFileSync(target.file, md, "utf-8");
+            writeRoomState(target, doc, md);
         };
         doc.flushToDisk = flush;
         // Registered after seeding, so the seed itself doesn't schedule a write.

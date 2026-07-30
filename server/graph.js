@@ -94,8 +94,15 @@ export function latestEdges(contents, latest) {
     return edges;
 }
 
-// CLI: node server/graph.js <dir> — print the graph a publish would stage.
+// CLI: node server/graph.js <working-tree> — print the graph a publish would
+// stage. Takes ONE working tree (docs/<owner>/<namespace>), not docs/ itself:
+// that's a directory of directories now, and buildAssetGraph has no processor
+// for a subdirectory.
 if (import.meta.url === `file://${process.argv[1]}`) {
-    const dir = process.argv[2] ?? "docs";
+    const dir = process.argv[2];
+    if (!dir) {
+        console.error("usage: node server/graph.js docs/<owner>/<namespace>");
+        process.exit(1);
+    }
     process.stdout.write(JSON.stringify(buildWikiGraph(dir), null, 2) + "\n");
 }

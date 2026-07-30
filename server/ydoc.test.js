@@ -6,7 +6,9 @@
 
 import assert from "node:assert/strict";
 import * as Y from "yjs";
-import { docMarkdown, seedFromMarkdown, isReadFrame } from "./ydoc.js";
+import {
+    docMarkdown, seedFromMarkdown, isReadFrame, encodeRoomState, applyRoomState,
+} from "./ydoc.js";
 
 const room = (md) => {
     const doc = new Y.Doc();
@@ -67,6 +69,40 @@ for (const md of [
     const merged = docMarkdown(alice.xml);
     assert.equal(merged, docMarkdown(bob.xml), "peers disagree — not convergent");
     assert.ok(merged.includes("Alice") && merged.includes("Bob"), `an edit was dropped: ${merged}`);
+}
+
+// ── a room outlives being evicted, and a returning peer doesn't double it ──
+//
+// Rooms are dropped when the last peer leaves and die with the process, but a
+// browser that loses its socket keeps its copy and re-sends it on reconnect.
+// This is the bug that made a note come back with its whole body twice.
+{
+    const file = "example\nabc";
+
+    // A peer joins a fresh room and just reads it — never types.
+    const first = room(file);
+    const saved = { md: docMarkdown(first.xml), update: encodeRoomState(first.doc) };
+    const peer = room();
+    sync(first, peer);
+
+    // Everyone leaves: the room is written to disk and evicted. Now the peer
+    // comes back and the room is rebuilt from what was persisted.
+    const resumed = { doc: new Y.Doc() };
+    resumed.xml = resumed.doc.get("content", Y.XmlText);
+    assert.equal(saved.md, file, "the snapshot has to describe the file it came from");
+    applyRoomState(resumed.doc, saved.update);
+
+    sync(peer, resumed); // the reconnecting browser pushes its copy back up
+    sync(resumed, peer);
+    assert.equal(docMarkdown(resumed.xml), file, "the note came back duplicated");
+    assert.equal(docMarkdown(peer.xml), file, "the peer is showing the note twice");
+
+    // …and the control: re-seeding from the same markdown is what used to
+    // happen, and is exactly why the state has to be persisted.
+    const reseeded = room(file);
+    sync(peer, reseeded);
+    assert.equal(docMarkdown(reseeded.xml), `${file}\n${file}`,
+        "re-seeding is supposed to duplicate — if it stopped, this test is no longer testing the fix");
 }
 
 // ── read-only peers: presence and "send me the state" pass, writes don't ──

@@ -5,6 +5,7 @@ import { deriveSecret, sealContent } from "./crypto.js";
 import { useEvents } from "./useEvents.js";
 import { buildBacklinks, moveInTree } from "./structure.js";
 import Editor, { CollabEditor } from "./Editor.jsx";
+import { exportHtml } from "./render.js";
 
 const short = (s) => (s ? `${s.slice(0, 8)}…${s.slice(-6)}` : "");
 
@@ -12,6 +13,37 @@ const short = (s) => (s ? `${s.slice(0, 8)}…${s.slice(-6)}` : "");
 // The server's watcher debounces 200ms before emitting, so this only has to
 // outlast that plus SSE delivery.
 const SELF_WRITE_MS = 1500;
+
+// ── leaving the app ───────────────────────────────────────────────
+// Export is one rendered document (see render.js) with two destinations: a file
+// on disk, and a hidden frame we ask the browser to print. Printing the frame
+// rather than the page means the export and the printout are the same document,
+// so there's no second print stylesheet to keep in step with the first.
+const download = (name, text, type) => {
+    const url = URL.createObjectURL(new Blob([text], { type }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
+};
+
+const printDocument = (html) => {
+    const frame = document.createElement("iframe");
+    frame.setAttribute("aria-hidden", "true");
+    frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0";
+    frame.srcdoc = html;
+    frame.onload = () => {
+        const win = frame.contentWindow;
+        // Chrome blocks on print(); Safari doesn't, so also clean up on the
+        // afterprint event and keep a timer as the last resort.
+        win.onafterprint = () => frame.remove();
+        win.focus();
+        win.print();
+        setTimeout(() => frame.isConnected && frame.remove(), 60_000);
+    };
+    document.body.appendChild(frame);
+};
 
 // Parse a repo reference to follow: a pasted share URL (?owner=&ns=&note=), or
 // a bare "owner/namespace". Returns { owner, ns, note } or null.
@@ -26,41 +58,95 @@ export function parseRepoRef(input) {
     return m ? { owner: m[1], ns: m[2].trim(), note: null } : null;
 }
 
+// Reordering the tree runs on pointer events, not HTML5 drag-and-drop: DnD
+// never fires for touch, so the sidebar was desktop-only. Dragging starts from
+// a grip (the only element with `touch-action: none`) so a finger anywhere else
+// on the row still scrolls the list.
+//
+// The drop marker is a class on the row under the pointer. It's feedback that
+// lasts exactly as long as the gesture and nothing re-renders mid-drag, so it
+// stays a DOM class rather than React state threaded down the recursion.
+const DROP_MARKS = ["drop-before", "drop-inside", "drop-after"];
+const clearMarks = () =>
+    document.querySelectorAll(".tree-row").forEach((el) => el.classList.remove(...DROP_MARKS));
+
+// The row under (x, y) and which third of it, or null if it isn't a drop.
+function dropAt(x, y, dragPath) {
+    const el = document.elementFromPoint(x, y)?.closest?.(".tree-row");
+    if (!el?.dataset.path || el.dataset.path === dragPath) return null;
+    const r = el.getBoundingClientRect();
+    const f = (y - r.top) / r.height;
+    return { el, path: el.dataset.path, zone: f < 0.3 ? "before" : f > 0.7 ? "after" : "inside" };
+}
+
 // One node of the explicit page tree (stored server-side; see structure.js),
 // rendered recursively. Writers can drag to reorder/nest and rename/delete.
 function TreeRow({ node, depth, notes, active, writable, onOpen, onMove, onRename, onDelete }) {
-    const [zone, setZone] = useState(null); // "before" | "inside" | "after"
+    const drag = useRef(null); // { x, y, id, started } while a drag is live
+    // A drag that ends where it began still emits a click, which would open the
+    // note you were only trying to move. Cleared on the next pointerdown, so a
+    // gesture that never produces a click can't eat a later one.
+    const justDragged = useRef(false);
     const title = notes.find((n) => n.path === node.path)?.title ?? node.path.replace(/\.md$/, "");
 
-    const onDragOver = (e) => {
-        if (!writable) return;
-        e.preventDefault();
-        const r = e.currentTarget.getBoundingClientRect();
-        const y = (e.clientY - r.top) / r.height;
-        setZone(y < 0.3 ? "before" : y > 0.7 ? "after" : "inside");
+    // Capture belongs on the ROW, never on the grip: the grip lives inside
+    // `.tree-actions`, which is `display:none` until the row is hovered, and a
+    // captured element that gets hidden fires pointercancel and kills the
+    // gesture. The row is always there.
+    const onPointerDown = (e) => {
+        if (e.button > 0) return;
+        if (e.target.closest(".tree-act:not(.tree-grip)")) return; // ✎ and ✕ are buttons, not handles
+        // A mouse can grab the row anywhere, the way the old HTML5 drag did —
+        // requiring a 17px hover-revealed grip to reorder was a regression.
+        // Touch has to start on the grip, because the grip is the only element
+        // that gives up `touch-action`, and the rest of the row has to stay
+        // free or the sidebar can't be scrolled with a finger.
+        if (e.pointerType !== "mouse" && !e.target.closest(".tree-grip")) return;
+        justDragged.current = false;
+        drag.current = { x: e.clientX, y: e.clientY, id: e.pointerId, started: false };
+        // Capture is deliberately NOT taken here. While a pointer is captured,
+        // the compatibility mouse events retarget to the capturing element, so
+        // the click lands on the row instead of the note button and opening a
+        // note by clicking it silently stops working. Capture is taken below,
+        // once the movement threshold says this is a drag and not a click.
     };
-    const onDrop = (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const drag = e.dataTransfer.getData("text/path");
-        if (drag && zone) onMove(drag, node.path, zone);
-        setZone(null);
+    const onPointerMove = (e) => {
+        const d = drag.current;
+        if (!d) return;
+        // A few pixels of slop, so a tap on the grip isn't a one-pixel move.
+        if (!d.started && Math.hypot(e.clientX - d.x, e.clientY - d.y) < 8) return;
+        if (!d.started) e.currentTarget.setPointerCapture(d.id); // now it's a drag: follow the pointer off the row
+        d.started = true;
+        e.currentTarget.classList.add("dragging"); // keeps the grip on screen once hover is gone
+        clearMarks();
+        const hit = dropAt(e.clientX, e.clientY, node.path);
+        if (hit) hit.el.classList.add(`drop-${hit.zone}`);
+    };
+    const onPointerUp = (e) => {
+        const d = drag.current;
+        drag.current = null;
+        e.currentTarget.classList.remove("dragging");
+        clearMarks();
+        if (!d?.started) return;
+        justDragged.current = true;
+        const hit = dropAt(e.clientX, e.clientY, node.path);
+        if (hit) onMove(node.path, hit.path, hit.zone);
     };
 
     return (
         <>
             <div
-                className={`tree-row ${zone ? `drop-${zone}` : ""}`}
-                draggable={writable}
-                onDragStart={(e) => e.dataTransfer.setData("text/path", node.path)}
-                onDragOver={onDragOver}
-                onDragLeave={() => setZone(null)}
-                onDrop={onDrop}
+                className="tree-row"
+                data-path={node.path}
+                onPointerDown={onPointerDown}
+                onPointerMove={onPointerMove}
+                onPointerUp={onPointerUp}
+                onPointerCancel={(e) => { drag.current = null; e.currentTarget.classList.remove("dragging"); clearMarks(); }}
             >
                 <button
                     className={`note-item ${node.path === active ? "active" : ""}`}
                     style={{ paddingLeft: `${10 + depth * 16}px` }}
-                    onClick={() => onOpen(node.path)}
+                    onClick={() => { if (!justDragged.current) onOpen(node.path); }}
                     title={node.path}
                 >
                     <span className="tree-glyph">{depth > 0 ? "└ " : ""}</span>
@@ -70,6 +156,7 @@ function TreeRow({ node, depth, notes, active, writable, onOpen, onMove, onRenam
                     <span className="tree-actions">
                         <button className="tree-act" title="Rename" onClick={() => onRename(node.path)}>✎</button>
                         <button className="tree-act" title="Delete" onClick={() => onDelete(node.path)}>✕</button>
+                        <button className="tree-act tree-grip" title="Drag to reorder">⠿</button>
                     </span>
                 )}
             </div>
@@ -230,6 +317,11 @@ export default function App({ address, onLogout }) {
     const [tree, setTree] = useState([]); // explicit page hierarchy (stored)
     const [active, setActive] = useState(null);
     const [content, setContent] = useState("");
+    // The open note's text as it stands right now. For a solo note that's just
+    // `content`, but a collab note is never saved through here — the room is —
+    // so it reports itself up, and this is what the read pane and Export use.
+    const [renderText, setRenderText] = useState("");
+    const [view, setView] = useState("split"); // edit | split | read
     const [saveState, setSaveState] = useState("saved"); // saved | unsaved | saving
     const [nudges, setNudges] = useState({}); // namespace → last on-chain NamespaceChange
     const [status, setStatus] = useState(null); // { kind: ok|err|busy, text, tx? }
@@ -258,6 +350,7 @@ export default function App({ address, onLogout }) {
         const note = await api.note(path);
         setActive(path);
         setContent(note.content);
+        setRenderText(note.content);
         setSaveState("saved");
         setNavOpen(false); // on mobile the drawer covers the note you just picked
     }, []);
@@ -271,7 +364,7 @@ export default function App({ address, onLogout }) {
         const list = await refreshNotes();
         const first = list.find((n) => n.path === "index.md") ?? list[0];
         if (first) await openNote(first.path);
-        else { setActive(null); setContent(""); }
+        else { setActive(null); setContent(""); setRenderText(""); }
         return current;
     }, [refreshNotes, openNote]);
 
@@ -285,6 +378,7 @@ export default function App({ address, onLogout }) {
     // to disk. Publishing is a separate, explicit act.
     const onChange = (next) => {
         setContent(next);
+        setRenderText(next);
         setSaveState("unsaved");
         clearTimeout(saveTimer.current);
         saveTimer.current = setTimeout(async () => {
@@ -313,6 +407,7 @@ export default function App({ address, onLogout }) {
             if (active && !dirtyRef.current && list.some((n) => n.path === active)) {
                 const note = await api.note(active);
                 setContent((cur) => (dirtyRef.current ? cur : note.content));
+                if (!dirtyRef.current) setRenderText(note.content);
             }
         },
         // A new commit settled on-chain for some tracked repo. Don't touch local
@@ -509,7 +604,7 @@ export default function App({ address, onLogout }) {
             if (active === path) {
                 const first = list.find((n) => n.path === "index.md") ?? list[0];
                 if (first) await openNote(first.path);
-                else { setActive(null); setContent(""); }
+                else { setActive(null); setContent(""); setRenderText(""); }
             }
         } catch (err) {
             setStatus({ kind: "err", text: `delete failed: ${err.message}` });
@@ -522,6 +617,7 @@ export default function App({ address, onLogout }) {
     };
 
     const activeTitle = notes.find((n) => n.path === active)?.title ?? active;
+    const exportDoc = () => exportHtml(renderText, activeTitle ?? "note");
     const backlinks = useMemo(() => buildBacklinks(notes), [notes]);
     const activeBacklinks = (backlinks.get(active) ?? []).map((p) => ({
         path: p,
@@ -558,16 +654,9 @@ export default function App({ address, onLogout }) {
                     onCreate={createRepo}
                     onFollow={followRepo}
                 />
-                <nav
-                    className="note-list"
-                    onDragOver={(e) => repo?.writable && e.preventDefault()}
-                    onDrop={(e) => {
-                        // Dropped on empty space → move to the end of the top level.
-                        const drag = e.dataTransfer.getData("text/path");
-                        const last = tree[tree.length - 1];
-                        if (drag && last && drag !== last.path) moveNote(drag, last.path, "after");
-                    }}
-                >
+                {/* ponytail: dropping on empty space is gone — drop "after" the
+                    last row for the same result. */}
+                <nav className="note-list">
                     {tree.map((node) => (
                         <TreeRow
                             key={node.path}
@@ -627,12 +716,45 @@ export default function App({ address, onLogout }) {
                         ☰
                     </button>
                     <span className="doc-title">{activeTitle ?? "—"}</span>
+                    {active && (
+                        <div className="view-switch" role="group" aria-label="View">
+                            {["edit", "split", "read"].map((m) => (
+                                <button
+                                    key={m}
+                                    className={`view-btn ${view === m ? "active" : ""}`}
+                                    aria-pressed={view === m}
+                                    onClick={() => setView(m)}
+                                    title={
+                                        m === "edit" ? "Markdown source only"
+                                            : m === "split" ? "Source beside the rendered document"
+                                                : "Rendered document — links are clickable"
+                                    }
+                                >
+                                    {m}
+                                </button>
+                            ))}
+                        </div>
+                    )}
                     {/* Public notes live in the shared room — the server persists
                         them, so there's no local save state to report. */}
                     {repo?.visibility !== "public" && (
                         <span className={`save-state ${saveState}`}>{saveState}</span>
                     )}
                     <span className="spacer" />
+                    {active && (
+                        <>
+                            <button
+                                className="btn"
+                                onClick={() => download(`${(activeTitle ?? active).replace(/[/\\?%*:|"<>]/g, "-")}.html`, exportDoc(), "text/html")}
+                                title="Download this note as a standalone HTML document"
+                            >
+                                ⤓ HTML
+                            </button>
+                            <button className="btn" onClick={() => printDocument(exportDoc())} title="Print (or save as PDF)">
+                                🖨
+                            </button>
+                        </>
+                    )}
                     {repo && repo.visibility !== "private" && (
                         <button className="btn share" onClick={shareLink} title="Copy a link — anyone can paste it to subscribe to this namespace">
                             🔗 Share
@@ -689,6 +811,10 @@ export default function App({ address, onLogout }) {
                                 address={address}
                                 getToken={getAccessToken}
                                 readOnly={!repo.writable}
+                                view={view}
+                                onViewChange={setView}
+                                onText={setRenderText}
+                                previewText={renderText}
                             />
                         ) : (
                             <Editor
@@ -697,6 +823,8 @@ export default function App({ address, onLogout }) {
                                 onNavigate={navigate}
                                 noteKey={active}
                                 readOnly={!repo?.writable}
+                                view={view}
+                                onViewChange={setView}
                             />
                         )}
                         {activeBacklinks.length > 0 && (

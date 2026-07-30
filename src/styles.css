@@ -66,13 +66,20 @@ body {
 /* ── Draggable page tree ─────────────────────────────── */
 .tree-row { position: relative; display: flex; align-items: center; border-radius: 6px; }
 .tree-row .note-item { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tree-row[draggable="true"] { cursor: grab; }
+/* The one element that owns the gesture: no browser panning/zooming on it, so
+   pointermove keeps flowing on touch instead of turning into a scroll. */
+.tree-grip { cursor: grab; touch-action: none; font-size: 14px; }
+.tree-grip:active { cursor: grabbing; }
 .tree-actions {
     display: none;
     gap: 2px;
     padding-right: 6px;
 }
-.tree-row:hover .tree-actions { display: flex; }
+/* Hover is gone the moment a drag leaves the row, so the row being dragged
+   keeps its controls on screen for the length of the gesture. */
+.tree-row:hover .tree-actions,
+.tree-row.dragging .tree-actions { display: flex; }
+.tree-row.dragging { opacity: 0.55; }
 .tree-act {
     border: 0;
     background: none;
@@ -239,6 +246,57 @@ body {
 .collab-panel-label { color: var(--text-dim); font-size: 11px; }
 .collab-panel-input { font: 12px/1.6 ui-monospace, monospace; resize: vertical; }
 .collab-panel-actions { display: flex; gap: 6px; }
+/* Source pane, read pane, or both side by side (see `view` in App.jsx). Either
+   pane collapses from the divider between them; the one that's left takes the
+   width, and the collapsed one leaves a rail to bring it back. */
+.panes { flex: 1; display: flex; min-height: 0; }
+.panes.split > .editor, .panes.split > .doc-view { flex: 1 1 50%; min-width: 0; }
+
+.pane-divider {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+    padding: 0 1px;
+    border-left: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    background: var(--bg-panel);
+}
+.pane-collapse {
+    width: 14px;
+    height: 22px;
+    border: 0;
+    border-radius: 3px;
+    background: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    font: 13px/1 system-ui, sans-serif;
+    padding: 0;
+}
+.pane-collapse:hover { background: var(--bg-hover); color: var(--text); }
+
+.pane-rail {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    width: 26px;
+    padding: 12px 0;
+    border: 0;
+    background: var(--bg-panel);
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 11px;
+}
+.pane-rail.left { border-right: 1px solid var(--border); }
+.pane-rail.right { border-left: 1px solid var(--border); }
+.pane-rail:hover { background: var(--bg-hover); color: var(--text); }
+.pane-rail-chev { font-size: 13px; }
+/* Vertical so a collapsed pane costs 26px of width, not a labelled column. */
+.pane-rail-label { writing-mode: vertical-rl; letter-spacing: 0.06em; }
+.pane-rail.right .pane-rail-label { rotate: 180deg; }
 .editor { flex: 1; display: flex; min-height: 0; justify-content: center; overflow-y: auto; }
 /* Single reading pane: markdown renders in place (see Editor.jsx decorations). */
 .editor-input {
@@ -306,6 +364,59 @@ body {
     user-select: none;
 }
 
+/* ── read pane ───────────────────────────────────────── */
+/* The rendered document (render.js). No caret, no syntax: this is where a link
+   is finally just a link. Typography deliberately runs a little larger and
+   looser than the source pane so the two read as source vs. document. */
+.doc-view { flex: 1; min-height: 0; overflow-y: auto; background: var(--bg); }
+.doc-render {
+    max-width: 740px;
+    margin: 0 auto;
+    padding: 40px 32px 45vh;
+    font: 17px/1.75 system-ui, -apple-system, "Segoe UI", sans-serif;
+    word-break: break-word;
+}
+.doc-render h1, .doc-render h2, .doc-render h3,
+.doc-render h4, .doc-render h5, .doc-render h6 { line-height: 1.25; margin: 1.6em 0 0.5em; font-weight: 700; }
+.doc-render h1 { font-size: 1.9em; }
+.doc-render h2 { font-size: 1.5em; }
+.doc-render h3 { font-size: 1.24em; }
+.doc-render h4, .doc-render h5, .doc-render h6 { font-size: 1.05em; margin-top: 1.4em; }
+.doc-render h1, .doc-render h2 { padding-bottom: 0.24em; border-bottom: 1px solid var(--border); }
+.doc-render > :first-child { margin-top: 0; }
+.doc-render p { margin: 0 0 1em; }
+.doc-render a { color: #539bf5; text-decoration: none; }
+.doc-render a:hover { text-decoration: underline; }
+.doc-render .wikilink { color: var(--accent); }
+.doc-render blockquote {
+    margin: 1em 0;
+    padding: 0.1em 0 0.1em 1em;
+    border-left: 3px solid var(--border);
+    color: var(--text-dim);
+    font-style: italic;
+}
+.doc-render ul, .doc-render ol { margin: 0 0 1em; padding-left: 1.5em; }
+.doc-render li { margin: 0.2em 0; }
+.doc-render li > ul, .doc-render li > ol { margin-bottom: 0; }
+.doc-render code {
+    font: 0.88em ui-monospace, monospace;
+    background: var(--bg-panel);
+    border-radius: 4px;
+    padding: 0.1em 0.34em;
+}
+.doc-render pre {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    overflow-x: auto;
+    margin: 0 0 1em;
+}
+.doc-render pre code { background: none; padding: 0; font-size: 0.85em; }
+.doc-render hr { border: 0; border-top: 1px solid var(--border); margin: 2em 0; }
+.doc-render img { max-width: 100%; border-radius: 6px; }
+.doc-render .katex-display { margin: 0.8em 0; }
+
 /* KaTeX ships its own error colour; keep it legible on the dark panel. */
 .katex-error { color: var(--danger) !important; }
 
@@ -372,6 +483,20 @@ body {
 .fmt-btn:active { background: var(--accent-soft); color: var(--accent); }
 .fmt-sep { width: 1px; height: 18px; margin: 0 6px; background: var(--border); }
 
+/* ── view switch (edit / split / read) ───────────────── */
+.view-switch { display: flex; padding: 2px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); }
+.view-btn {
+    padding: 3px 10px;
+    border: 0;
+    border-radius: 4px;
+    background: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    font: 12px/1.4 inherit;
+}
+.view-btn:hover { color: var(--text); }
+.view-btn.active { background: var(--bg-hover); color: var(--text); }
+
 /* ── Login gate + account bar ─────────────────────────────────────────── */
 .gate { display: flex; align-items: center; justify-content: center; height: 100vh; background: var(--bg); }
 .gate-card { text-align: center; padding: 40px 44px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px; max-width: 380px; }
@@ -406,6 +531,12 @@ body {
     .topbar { flex-wrap: wrap; gap: 6px; }
     .topbar, .status, .banner, .backlinks, .fmt-bar, .presence-bar { padding-left: 10px; padding-right: 10px; }
     .editor-input { padding: 20px 16px 45vh; }
+    .doc-render { padding: 20px 16px 45vh; }
+    /* No room for two panes on a phone: split falls back to the source, so the
+       divider has nothing to divide — the rail and the switch are how you get
+       to the rendered document. */
+    .panes.split > .doc-view, .panes.split > .pane-divider { display: none; }
+    .panes.split > .editor { flex-basis: 100%; }
     .gate-card { padding: 28px 20px; margin: 16px; }
 
     /* Anything under 16px makes iOS zoom the whole page on focus. */

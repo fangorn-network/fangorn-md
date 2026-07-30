@@ -1,394 +1,411 @@
 # fangornmd
 
-A personal, self-hosted HackMD-style wiki whose storage layer is the
-[Fangorn network](https://github.com/fangorn-network/fangorn). Your notes are
-plain markdown files on disk; publishing snapshots them into a versioned,
+A self-hosted, collaborative markdown wiki whose storage layer is the
+[Fangorn network](https://github.com/fangorn-network/fangorn). Notes are plain
+markdown files on disk; publishing snapshots them into a versioned,
 content-addressed graph settled on-chain (Arbitrum Sepolia), with blocks pinned
-to IPFS. Anyone can then *clone* your wiki by address + namespace, read it,
-and live-sync as you push updates — no central server anywhere.
+to IPFS. Anyone can then follow your wiki by address + namespace, read it, and
+live-sync as you push updates.
 
-This README doubles as the **dev guide**: it builds the whole app up from a
-15-line graph builder, and every design decision is explained in terms of what
-the Fangorn SDK actually does. If you follow it top to bottom you'll understand
-enough to build your own Fangorn-backed app.
+Two properties are the whole point, and they're why this isn't a worse Google
+Drive:
+
+- **Self-custodial.** The server holds no user keys. Every on-chain settlement
+  is signed by the user's own wallet in their browser. Private namespaces are
+  encrypted client-side — the server pins ciphertext it cannot read.
+- **Published, not shared.** A publish is a signed, content-addressed snapshot
+  that exists independently of this server. A reader can see who signed a page
+  and the exact hash of what they're reading, which is something a link to a
+  hosted doc can never tell them.
+
+This README doubles as the **dev guide**: it builds the app up from a single
+graph-building function, and explains each design decision in terms of what the
+Fangorn SDK actually does. Deployment lives in [DEPLOY.md](DEPLOY.md).
 
 ```
-┌─────────────────────────── your machine ───────────────────────────┐
-│                                                                     │
-│  docs/*.md          server/index.js                src/ (Vite)      │
-│  (working tree) ◄──► local API server  ◄── /api ──► React editor    │
-│                       │        ▲                                    │
-│                 @fangorn-network/sdk                                │
-└───────────────────────┼────────┼───────────────────────────────────┘
-                 commit/push   subscribe (poll StateCommitted)
-                        ▼        │
-              Arbitrum Sepolia (DataRegistry contract)
-                        │
-                   IPFS / Pinata (commit + vertex blocks)
+┌──────────────────────── one Node process ─────────────────────────┐
+│                                                                    │
+│  docs/<owner>/<ns>/*.md      server/index.js         dist/ (SPA)   │
+│  (working trees)      ◄──►   relay + API      ──►    React editor  │
+│                                │      ▲  ▲                         │
+│                                │      │  └── /yjs/*  live co-edit  │
+│                       @fangorn-network/sdk (keyless service key)   │
+└────────────────────────────────┼──────┼────────────────────────────┘
+                       prepare/read   subscribe (StateCommitted)
+                                 ▼      │
+                    Arbitrum Sepolia (DataRegistry)
+                                 │            ▲
+                     IPFS / Pinata (blocks)   └── settlement tx, signed
+                                                  by the USER's wallet
 ```
-
-Three pieces, smallest possible surface each:
 
 | Piece | File(s) | Job |
 |---|---|---|
-| Working tree | `docs/*.md` | Your notes. Plain files — edit them with anything. |
-| Local server | [server/index.js](server/index.js), [server/graph.js](server/graph.js) | Wraps the SDK: read/write files, publish, pull, stream live changes. |
-| Editor | [src/](src/) | HackMD-style split editor talking to the server over HTTP + SSE. |
+| Working trees | `docs/<owner>/<ns>/*.md` | The notes. Plain files — edit them with anything. |
+| Relay + API | [server/index.js](server/index.js), [server/graph.js](server/graph.js), [server/ydoc.js](server/ydoc.js) | Files, publish prep, pull, live rooms, change feed, public read. |
+| Editor | [src/](src/) | Slate-based markdown editor talking to the server over HTTP, SSE and WebSocket. |
 
-The browser never touches the SDK directly — it needs Node (filesystem block
-cache, wallet key, LMDB) — so all Fangorn work happens in the ~250-line local
-server and the frontend stays a dumb, replaceable client. That is also what
-will make a mobile client easy later: it's just another consumer of the same
-tiny API.
+The browser never touches the SDK directly — it needs Node (block cache, LMDB,
+gateway access) — so all Fangorn work happens server-side and the frontend
+stays a replaceable client. The one thing the server deliberately *cannot* do
+is sign for a user.
 
 ---
 
 ## 0. Fangorn in five minutes
 
-Concepts you need before any code makes sense:
-
 **One publisher, one root.** Every wallet address owns exactly one on-chain
-state root in the `DataRegistry` contract. *Namespaces* (like `fangornmd`) are
-key prefixes inside that root's [Pail](https://github.com/web3-storage/pail)
-tree — so "a repo" is `(owner address, namespace name)`, and cloning needs
-both.
+state root in the `DataRegistry` contract. Namespaces are key prefixes inside
+that root's [Pail](https://github.com/web3-storage/pail) tree, and they're
+hierarchical: `app:publisher:namespace`. fangornmd owns the `fangornmd` app
+prefix, so every wiki this server serves lives under it — which is what lets
+one subscription see the whole instance instead of a per-publisher fan-out.
+A "repo" is `(owner address, namespace)`, and following one needs both.
 
-**Vertices and edges, content-addressed.** Data is a graph. A vertex is
-`{ tag, payload }`, stored as a dag-cbor block whose CID is the hash of its
-content, keyed at `<ns>/v/<cid>`. An edge is a `(source cid, relation, target
-cid)` triple. Identical payload ⇒ identical CID ⇒ identical key: re-staging
-unchanged data is a free no-op. We lean on this constantly.
+**Vertices and edges, content-addressed.** A vertex is `{ tag, payload }`,
+stored as a dag-cbor block whose CID is the hash of its content. An edge is a
+`(source cid, relation, target cid)` triple. Identical payload ⇒ identical CID
+⇒ identical key: re-staging unchanged data is a free no-op. We lean on this
+constantly.
 
-**Git-native flow.** `fangorn.commit()` seals staged data into a commit object
-(parents, timestamp, message, tree root) *locally* — no transaction.
-`fangorn.push()` fast-forwards your on-chain root to a commit — one cheap
-transaction regardless of commit size. `.fangorn/repo.json` is the analogue of
-`.git/HEAD`: namespace, owner, local tip CID. There is no local object store
-to sync — blocks live in content-addressed storage (Pinata/IPFS, with a local
-disk cache).
+**Git-native flow.** `commit()` seals staged data into a commit object locally —
+no transaction. Settling fast-forwards the on-chain root to that commit — one
+cheap transaction regardless of commit size. There is no local object store to
+sync: blocks live in content-addressed storage, with a local disk cache.
 
 **The store is append-only.** There is no "update vertex" — keys are content
 hashes, so editing a note *adds a new version* and the old one stays. This is
-the single most important constraint for app design, and the next section is
-about designing with it rather than against it.
+the single most important constraint for app design, and §1 is about designing
+with it rather than against it.
 
-**Subscribe is a light client.** `fangorn.subscribe()` watches the contract's
-`StateCommitted` events and diffs the old root against the new one itself —
-no indexer, no backend. It yields exactly what changed in your namespace:
-added/removed vertices and edges, plus the block number to use as a resume
-cursor.
+**Subscribe is a light client.** `fangorn.subscribe()` watches `StateCommitted`
+events and diffs the old root against the new one itself — no indexer. It
+yields exactly what changed: added/removed vertices and edges, plus a block
+number to resume from.
 
 ## 1. The data model: notes as versioned vertices
 
-A naive mapping — vertex payload = `{ content }` — breaks on the first edit:
+A naive mapping — payload = `{ content }` — breaks on the first edit. The id
+you stage with isn't stored (it only resolves edges within that `commit()`
+call), and editing appends, so after two edits of `index.md` the namespace
+holds three `doc` vertices with nothing saying which is current.
 
-- the *id you staged with is not stored*. `commit()` takes `{ id, tag, payload }`
-  but the id only resolves edges within that call; on read you get back
-  `{ cid, schemaId, payload }`. If the payload doesn't say which note it is,
-  that information is gone.
-- editing appends. After two edits of `index.md` the namespace holds three
-  `doc` vertices, and nothing says which is current.
-
-So the payload itself must carry identity and order:
+So the payload carries identity and order itself:
 
 ```js
 { path: "index.md", content: "# My Wiki…", updatedAt: 1770000000000 }
 ```
 
-Reading the wiki is then a reduce, [server/graph.js](server/graph.js)
-`latestByPath()`: group every `doc` vertex by `payload.path`, keep the highest
-`updatedAt`. Older versions aren't garbage — they're the note's revision
-history, for free.
+Reading the wiki is then a reduce — [server/graph.js](server/graph.js)
+`latestByPath()`: group every vertex by `payload.path`, keep the highest
+`updatedAt` (CID as a deterministic tie-break). Older versions aren't garbage,
+they're the revision history, for free.
 
-Two subtleties, both load-bearing:
+Three subtleties, all load-bearing:
 
 **Publish the whole graph every time.** Edges can only reference vertices
-staged *in the same `commit()` call* (the SDK resolves edge endpoints from
-that call's local-id map). A link from an edited note to an untouched one
-therefore requires staging the untouched note too. That's fine — its payload
-is byte-identical, so its CID and key are identical, and staging it costs
-nothing. Full-graph publishes keep the code trivial *because* of content
+staged in the same `commit()` call, so a link from an edited note to an
+untouched one requires staging the untouched note too. That's fine — its
+payload is byte-identical, so its CID and key are identical, and staging it
+costs nothing. Full-graph publishes stay trivial *because* of content
 addressing.
 
-**Only stamp `updatedAt` when content changed.** If we stamped every file at
-publish time, every payload would differ every time and every publish would
-append a full set of new versions. Instead `buildWikiGraph()` compares each
-file against the latest remote version and reuses the *remote payload
-verbatim* when the content matches:
+**Only stamp `updatedAt` when content changed.** Stamping every file at publish
+time would make every payload differ every time, appending a full set of new
+versions on every publish. `buildWikiGraph()` compares each file against the
+latest remote version and reuses the remote payload verbatim when it matches.
 
-```js
-const payload =
-    remote && remote.payload.content === content
-        ? remote.payload   // unchanged → identical CID → free no-op
-        : { path: file.name, content, updatedAt: Date.now() };
-```
+**The hierarchy is a vertex too.** `.tree.json` rides along as a `meta` vertex,
+so followers reconstruct the exact sidebar order rather than guessing (§6).
 
 ## 2. Setup
 
 Prerequisites:
 
 - Node ≥ 20.19, [pnpm](https://pnpm.io)
-- A throwaway EVM wallet private key, funded with a little
-  [Arbitrum Sepolia ETH](https://www.alchemy.com/faucets/arbitrum-sepolia)
-  (pushes are ~one cheap tx each)
-- A free [Pinata](https://pinata.cloud) account (JWT + gateway domain) — this
-  is where blocks are pinned
+- A [Privy](https://dashboard.privy.io) app id — this is how users log in and
+  how each gets an embedded wallet
+- A throwaway EVM key for the **service** wallet. It builds graphs, reads, and
+  pins; it never signs a user's settlement, and **it needs no funds**
+- A [Pinata](https://pinata.cloud) gateway domain for reads
 
 ```sh
 pnpm install
-cp .env.example .env      # fill in ETH_PRIVATE_KEY, PINATA_JWT, PINATA_GATEWAY
+cp .env.example .env      # ETH_PRIVATE_KEY, PINATA_GATEWAY, VITE_PRIVY_APP_ID
+pnpm dev                  # API server (:8787) + Vite (:5173)
 ```
 
-One-time on-chain setup (the SDK ships the `fangorn` CLI):
+Open http://localhost:5173, log in, create a namespace, write, hit **Publish**.
+
+The `fangornmd` app prefix must be claimed on-chain once before anyone can
+publish under it; the server checks at boot and prints the exact `cast send` to
+run if it isn't. Individual wallets also need to be registered as publishers to
+write at all — that's a Fangorn-level step, separate from this app.
+
+## 3. Files → graph
+
+`buildAssetGraph(dir, { processors })` walks a directory and turns each file
+into a vertex plus outgoing links. The whole "compiler" is
+[server/graph.js](server/graph.js): `.md` files become `doc` vertices, and
+`.tree.json` becomes a `meta` vertex with no edges. It returns
+`{ vertices, edges }` — exactly what `commit()` accepts.
 
 ```sh
-pnpm exec fangorn register                  # register your wallet as a publisher
-pnpm exec fangorn repo init fangornmd       # allocate the namespace, write .fangorn/repo.json
+pnpm graph docs/<owner>/<namespace>    # the graph a publish would stage, as JSON
 ```
 
-> Cloning someone else's wiki instead? Skip both and see [§8](#8-cloning-someone-elses-wiki).
+The argument is a single working tree. `docs/` itself holds one subdirectory
+per owner, each holding one per namespace.
 
-Then run everything:
+**Edges come from the stored page hierarchy** — `childrenByPath` maps each note
+to its children, and those parent → child pairs are the only edges published.
+`[[wikilinks]]` are navigation, and don't affect the graph. See §6.
 
-```sh
-pnpm dev        # starts the API server (:8787) and Vite (:5173) together
-```
+## 4. The relay
 
-Open http://localhost:5173, edit, hit **Publish**.
+[server/index.js](server/index.js) is a plain `node:http` server, no framework.
 
-## 3. Part one — files → graph
+Auth is a Privy access token (verified against Privy's JWKS) plus an asserted
+wallet address. The assertion is safe because it's the *settlement transaction*
+that authenticates a publish on-chain: you can stage under any address, but you
+can only settle from the wallet you hold.
 
-Everything starts from one function. `buildAssetGraph(dir, { processors })`
-(from the SDK's harness) walks a directory and lets you turn each file type
-into a vertex + outgoing links; `extractMarkdownLinks` pulls both
-`[text](page.md)` and `[[wikilink]]` targets out of markdown. Our whole
-"compiler" is [server/graph.js](server/graph.js):
-
-```js
-buildAssetGraph(dir, {
-    processors: {
-        ".md": (file) => ({
-            tag: "doc",
-            payload: /* §1: path + content + conditional updatedAt */,
-            links: extractMarkdownLinks(file.readText()),
-        }),
-    },
-});
-```
-
-It returns `{ vertices, edges }` — exactly the shape `fangorn.commit()`
-accepts. Links to files that don't exist are dropped, self-links are dropped,
-and edges all get `rel: "links"`. Try it:
-
-```sh
-pnpm graph      # prints the graph a publish would stage, as JSON
-```
-
-You can drive the whole lifecycle from the CLI with nothing but that JSON —
-useful to demystify what the server automates later:
-
-```sh
-pnpm graph > commit.json
-pnpm exec fangorn repo commit commit.json -m "first snapshot"   # local commit
-pnpm exec fangorn repo push                                     # settle on-chain
-pnpm exec fangorn repo log                                      # walk history
-pnpm exec fangorn repo read                                     # dump the namespace
-```
-
-## 4. Part two — the local server
-
-[server/index.js](server/index.js) is a plain `node:http` server (no
-framework) exposing the working tree and the SDK:
+State is one file per user at `.fangorn/users/<address>.json` — no shared
+mutable state between users.
 
 | Route | What it does |
 |---|---|
-| `GET /api/repo` | Repo pointer + your wallet address + `writable` (are you the owner?) |
-| `GET /api/notes` | List `docs/*.md` (path + first-heading title) |
-| `GET /api/notes/:path` | Read one note |
-| `PUT /api/notes/:path` | Write one note (the editor's autosave) |
-| `GET /api/remote` | Latest version of every note *on-chain*, plus the link graph |
-| `POST /api/publish` | Snapshot `docs/` → `commit()` → `push()` |
-| `POST /api/pull` | Materialize the on-chain latest versions into `docs/` |
-| `GET /api/history` | `fangorn.log()` from the local tip |
-| `GET /api/events` | SSE stream: `local-change` + `remote-change` |
+| `GET /api/repos` · `GET /api/repo` | Every tracked namespace / the active one |
+| `POST /api/repos` | Create a namespace (`public` or `private`) |
+| `POST /api/repos/follow` | Track someone else's namespace, read-only |
+| `POST /api/repos/active` | Switch namespace |
+| `PUT /api/collaborators` | Owner-only: who else may edit the working tree |
+| `GET /api/notes` | List notes + the stored tree |
+| `GET`/`PUT`/`DELETE /api/notes/:path` | Read / write / delete one note |
+| `POST /api/notes/:path/rename` | Move a note, rewriting it through the tree |
+| `PUT /api/tree` | Persist the drag-and-drop hierarchy |
+| `GET /api/remote` | Latest published version of every note, plus edges |
+| `POST /api/pull` | Materialize published versions into the working tree |
+| `POST /api/publish/prepare` | Build + pin the commit, return an **unsigned** tx |
+| `POST /api/settle` | Record the head after the browser's tx confirms |
+| `GET /api/history` | Walk commits from the current head |
+| `GET /api/events` | SSE: `local-change` + `remote-change` |
+| `GET /r/:owner/:ns/:note.md` | **Public read — no auth** (§10) |
 
-The interesting handlers:
+**Collaborators work in the owner's directory** — same files, same
+`.tree.json`. The alternative, giving each collaborator their own copy, means a
+friend's edits never reach the tree the owner publishes. One shared tree makes
+"the owner publishes what we all wrote" true by construction. Someone who only
+follows a namespace (§11) gets their own copy instead, since they never write
+to it.
 
-**Publish** is four lines of SDK against everything §1 set up: fetch remote
-latest (so unchanged payloads are reused), build the graph, `commit()`,
-`push()`. The parent chain is what makes `fangorn repo log` show real history.
-One trap worth internalizing: the commit is parented on the **on-chain tip**,
-not the local head. A publisher's root spans *all* of its namespaces, so a
-commit built on a stale parent would — once settled — silently roll back
-whatever your other namespaces pushed in the meantime. Ask this repo's author
-how he knows. If a push still fails with a fast-forward error, another device
-pushed while you were committing — just publish again.
+Note paths are validated against `^[\w][\w .-]*\.md$`. A namespace is a display
+name people type, but it also becomes a directory name and part of a
+collaboration room's key (§7), so it's validated as a blacklist of what would
+break those rather than a whitelist of safe characters.
 
-**Reading a cloned repo** uses `fangorn.engine.listNamespace(namespace, owner)`
-rather than `fangorn.inspectNamespace(namespace)`: the latter is a shorthand
-hard-wired to *your own* address, and a clone's owner isn't you.
+## 5. The editor
 
-**Writable vs read-only.** A wallet can only push to its own root. The server
-compares `repo.json`'s `owner` with its wallet and refuses `POST /api/publish`
-on clones with a 403 — the UI hides the button entirely.
+[src/Editor.jsx](src/Editor.jsx) is a [Slate](https://docs.slatejs.org) editor
+where **markdown is the source of truth and is styled in place**. The Slate
+value is just the text, one paragraph per line; decorations style it without
+rewriting it, so what serializes back is byte-for-byte what was typed. Syntax
+markers (`**`, `#`, `[[ ]]`) collapse to zero width unless the caret is on that
+line, so a document reads rendered while staying fully editable — no separate
+source pane to keep in sync.
 
-Note paths are validated against `^[\w][\w .-]*\.md$` — the note namespace is
-flat, and nothing resembling a path traversal gets near `join(DOCS, path)`.
+- **Three view modes** — edit, split, read.
+- **Math** — `$inline$` and `$$display$$` via KaTeX, rendered when the caret is
+  elsewhere and falling back to source when you're editing that line
+  ([src/mdmath.js](src/mdmath.js)).
+- **Images** — pasted or dropped, inlined as data-URIs, capped at 1 MB. No
+  upload endpoint and no blob store, so a note stays one self-contained `.md`
+  that survives publish → pull → sync unchanged. This is the main thing
+  blocking "real" documents; see §13.
+- **Rendering** — [src/render.js](src/render.js) is a small hand-written
+  markdown → HTML renderer shared by the read pane, Export, and the public page.
+  Nothing from a note reaches the output unescaped, and only `http(s):`,
+  `mailto:` and `data:image/` URLs survive — a followed namespace is someone
+  else's text rendering in your browser.
 
-## 5. Part three — the editor
+## 6. The page hierarchy
 
-The Vite app ([src/](src/)) is deliberately boring React:
+The sidebar's shape is data, kept in `.tree.json` inside the repo: an ordered,
+nested `[{path, children}]` structure. Drag-and-drop rewrites it, publish
+derives the graph's edges from it (parent → child), and it rides the directory
+scan like any other file, so it publishes and pulls for free — a follower gets
+the author's exact hierarchy, order included.
 
-- [src/App.jsx](src/App.jsx) — sidebar (note list, repo identity), topbar
-  (save state, Publish), and the remote-change banner. Autosave debounces
-  600 ms of quiet, then `PUT`s the file. Saving and publishing are separate
-  acts, exactly like git: the file is your working tree, publish is
-  commit+push.
-- [src/Editor.jsx](src/Editor.jsx) — the HackMD split: textarea left,
-  rendered preview right. `marked` renders, `DOMPurify` sanitizes — a cloned
-  wiki is *someone else's content running in your app*, so raw HTML is never
-  trusted. `[[wikilinks]]` are rewritten to normal links, and clicks on
-  relative `.md` links navigate in-app instead of reloading.
-- [vite.config.js](vite.config.js) — proxies `/api` to `:8787` so the browser
-  sees one origin and CORS never comes up.
+The alternative is inferring structure from markdown links, which is what a
+link-graph wiki does. Storing it means moving a page is a drag rather than a
+link-wrangling exercise, and it means the published edges say what the author
+meant rather than what their prose happened to reference.
 
-### Structure is inferred from links
+The tree is reconciled against what's on disk on every read: nodes whose file
+vanished are dropped, new files are appended as unfiled roots. So an external
+editor, a pull, or a crash can never leave the sidebar pointing at nothing.
 
-There are no folders. The sidebar's filesystem-like tree is *derived from the
-link graph* — the same edges a publish stages on-chain — in
-[src/structure.js](src/structure.js):
+Dragging works with a mouse anywhere on a row; on touch it starts from the
+row's grip, because the grip is the only element that gives up `touch-action`
+and the rest of the row has to stay free for scrolling.
 
-- `GET /api/notes` returns each note's outgoing links (via the SDK's
-  `extractMarkdownLinks`, which catches both `[text](page.md)` and
-  `[[wikilink]]`), **in document order**, deduped, dropping targets that don't
-  exist.
-- `buildTree()` takes the BFS spanning tree rooted at `index.md`: every note
-  hangs under the *shallowest* note that links to it, and siblings keep the
-  order they appear in the parent's text. The graph can have cycles and
-  multiple in-links; BFS with a visited set collapses it to a tree
-  deterministically.
-- Notes nothing links to are grouped under **unlinked** — that's your prompt
-  to weave them in.
-- `buildBacklinks()` reverses the graph; the strip under the editor shows
-  which notes link *to* the open one.
+`[[wikilinks]]` are for cross-references: ⌘/Ctrl-click one to jump, and the
+backlinks strip under the editor shows which notes point at the open one
+([src/structure.js](src/structure.js)).
 
-So "moving" a note is just editing markdown: add a link to it from a
-different page and the tree reorganizes on the next autosave (the sidebar
-refreshes on every `local-change` event). Because the structure lives in the
-published edges rather than any local convention, someone who clones your
-wiki sees exactly the same tree.
+## 7. Live collaboration
 
-## 6. Part four — live sync
+Public namespaces get one Yjs room per note, named `owner:namespace:note`
+([server/ydoc.js](server/ydoc.js)). Everyone viewing a note joins and sees
+keystrokes live; only the owner and named collaborators may type.
 
-The flow, end to end:
+The server owns the room lifecycle rather than relaying blindly:
 
-1. The browser opens `EventSource("/api/events")`
-   ([src/useEvents.js](src/useEvents.js)).
-2. On the first SSE client, the server starts
-   `fangorn.subscribe({ namespace, owner, signal })` and forwards every
-   `NamespaceChange` as a `remote-change` event. When the last client
-   disconnects, the `AbortController` stops the watch — no chain polling while
-   nobody's looking.
-3. A change carries `addedVertices`, `removedVertexCids`, `commitCid`, and
-   `blockNumber`. The UI shows a banner: *"Remote updated — Pull"*.
-4. **Pull** writes the on-chain latest versions into `docs/`, the server's
-   `fs.watch` on `docs/` fires a `local-change` event, and every open editor
-   reloads (unless it has unsaved edits, which are never clobbered).
+- **Seed** — the room is filled from the owner's file when created, so whoever
+  arrives first sees the document instead of a blank page.
+- **Persist** — merged text is written back to the owner's working tree on a
+  debounce. This is what makes collaboration real: a friend's edits land in the
+  tree the owner publishes even when the owner isn't connected.
+- **Survive eviction** — a room lives only while someone is in it, but a
+  browser that loses its socket keeps its copy and re-sends on reconnect.
+  Re-seeding from markdown would mint new CRDT identities for the same words,
+  and the note would come back with its whole body twice. So the room's *state*
+  is snapshotted, not just its text, and restored only while it still decodes
+  to what's on disk.
+- **Enforce read-only server-side** — a viewer may request state and publish
+  awareness; the two frame types that mutate the document are dropped. Because
+  rooms persist to the owner's tree, this is a file-integrity boundary rather
+  than a UI nicety, so it's enforced here instead of trusted to the client.
 
-Deliberate choices worth copying:
+Renaming or deleting a note closes its room before touching the file. A room
+outlives the file it mirrors: its debounced flush, and the write triggered when
+the last peer leaves, would both re-create the note at the old path — leaving a
+rename with a copy under each name.
 
-- **Pull is explicit.** Auto-applying remote changes to a directory the user
-  also edits by hand is how you eat someone's work. The subscription only
-  *notifies*; a human clicks Pull.
-- **Your own publishes echo back** — `subscribe` watches the chain, and you
-  committed to the chain. Pulling after your own publish is a no-op (contents
-  already match), so the server doesn't bother filtering self-echoes.
-- The CLI version of all this is `pnpm exec fangorn subscribe`, which also
-  persists `blockNumber` as a resume cursor
-  (`.fangorn/subscribe-*.json`) so a restarted watcher replays exactly what it
-  missed. The server currently subscribes live-only and relies on Pull for
-  catch-up, which is simpler and always correct — the cursor trick matters
-  when you need *every intermediate* change, not just current state.
+Private namespaces never open a room: their content is ciphertext the server
+can't read, and a live plaintext room would defeat that.
 
-## 7. Performance: where publish time actually goes
+## 8. Publishing, self-custodially
 
-A publish is three phases, and the server logs each one
-(`[publish] read 0.2s · commit+flush 6.1s · push 3.4s`):
+Publish is a three-step handshake, because the server must never hold the key
+that moves your on-chain root:
 
-1. **Read remote state.** Walking the namespace from the on-chain root means
-   fetching pail shard blocks and vertex/edge blocks from the IPFS gateway —
-   *sequentially, one HTTP round-trip per block*. Cold, this dominates
-   everything (tens of seconds). Two caches attack it:
-   - The SDK keeps every block it sees in an in-process memory cache.
-   - The server keys the whole walk by the owner's **on-chain tip**
-     (`remoteState()` in [server/index.js](server/index.js)): one cheap RPC
-     read per call answers "is my cached walk still current?", and the cache
-     is warmed in the background at boot. After your own publish the re-walk
-     is nearly free — every block the commit staged is already in memory.
-2. **Commit + flush.** Sealing the commit is local and instant; the flush
-   uploads each *new* block as its own Pinata pin (bounded concurrency,
-   default 16 — tune with `PINATA_UPLOAD_CONCURRENCY`). An upload ledger at
-   `~/.fangorn/upload-ledger/` remembers what the gateway already has, so
-   re-publishing unchanged content uploads nothing.
-3. **Push.** One transaction + receipt wait on Arbitrum Sepolia. A few
-   seconds, and irreducible — that's consensus.
+1. `POST /api/publish/prepare` — flush open rooms to disk, read remote state,
+   reconcile and persist the tree, build the graph, seal it if private, then
+   `prepareCommit()`: the commit is built and pinned, and an **unsigned**
+   settlement tx comes back with gas and fees already quoted.
+2. The browser sends that tx from the user's Privy wallet.
+3. `POST /api/settle` records the new head once it confirms.
 
-So the expected shape is: first operation after boot is slow (cold walk),
-everything after is bounded by "new blocks uploaded + one transaction" — a
-single-note edit publishes in seconds. If publish is consistently slow,
-check the server log to see *which* phase it is: a slow `read` means the tip
-cache isn't being hit (server restarted between every publish?); a slow
-`commit+flush` means lots of new blocks or a struggling uplink to Pinata; a
-slow `push` is the RPC endpoint.
+The commit is parented on the **on-chain tip**, not the local head. A
+publisher's root spans all of its namespaces, so a commit built on a stale
+parent would silently roll back whatever another namespace pushed in the
+meantime. If a settlement would revert, `prepare` surfaces it as a 409 rather
+than letting it fail in the wallet.
 
-## 8. Cloning someone else's wiki
+Only the owner's wallet can settle. Collaborators can write and co-edit the
+working tree; publishing is the owner's act.
 
-A wiki is fully identified by `(owner address, namespace)`. To follow one:
+## 9. Private namespaces
+
+A private repo's notes are sealed in the browser
+([src/crypto.js](src/crypto.js)) with a key derived from a deterministic wallet
+signature — Privy never exposes the raw private key, so the secret is derived,
+not stored. At publish, `content` is swapped for `enc` before the commit; the
+server pins ciphertext it cannot read.
+
+`path` and `updatedAt` stay clear because they carry identity and ordering, so
+**filenames leak and bodies don't**. Server-side, any encrypted payload is
+replaced with a placeholder before it can reach a response — the server can't
+decrypt, and won't pretend to.
+
+## 10. Public read (and agents)
+
+`GET /r/:owner/:namespace/:note.md` serves the last **published** snapshot to
+anyone — no token, no wallet, no SPA shell. The HTML arrives rendered, which is
+what makes it work for a stranger's browser, a link preview, a crawler and an
+agent's fetch all at once; those are the same requirement, so they get one
+route.
+
+- `Accept: text/markdown` returns the source instead. Markdown is what's
+  stored, so there's no lossy conversion step — the format an agent wants is
+  the format on disk.
+- Every page carries provenance: signing address, date, and content hash.
+- `ETag` is the CID. A published note is immutable, so a cache hit is always
+  valid.
+- Only namespaces this server knows *and* that are marked public are served —
+  otherwise this server becomes an open gateway for the whole network.
+- Working-tree drafts are never served. Publishing is deliberate.
+
+## 11. Following and sharing
+
+A wiki is fully identified by `(owner address, namespace)`. **Share** copies a
+link carrying both; opening it offers to subscribe, pull, and open the note.
+Following is read-only and needs no permission from anyone — reading and
+subscribing are unpermissioned by construction.
+
+Live sync: the browser holds one `EventSource` on `/api/events`. Remote changes
+come off a single app-wide subscription (fangornmd owns the app prefix, so one
+topic filter covers every wiki on the instance) and each connection picks out
+the namespaces it tracks. The UI shows a banner; **Pull is explicit**, because
+auto-applying remote changes to a directory a human also edits is how you eat
+someone's work.
+
+## 12. Performance
+
+Publish logs its phases. Expect the first operation after boot to be slow — a
+cold namespace walk is one sequential gateway fetch per block — and everything
+after to be bounded by "new blocks uploaded + one transaction". The walk is
+keyed by the on-chain tip, so one cheap RPC read answers "is my cached walk
+current?", and after your own publish the re-walk is nearly free because every
+block the commit staged is already in memory.
+
+If publish is consistently slow, the log says which phase: a slow read means
+the tip cache isn't being hit; a slow commit+flush means many new blocks or a
+struggling uplink; a slow settle is the RPC endpoint or consensus.
+
+## 13. Limitations & where to take it
+
+Roughly in the order they're worth fixing:
+
+- **No blob storage.** Images are data-URIs capped at 1 MB, which rules out
+  real documents and means any future "import from Google Docs / Dropbox"
+  arrives with broken images. This is the next structural piece.
+- **No deletes on-chain.** Removing a file drops it from future edges, but its
+  latest version still wins the `latestByPath` reduce, so a pull can resurrect
+  it. The fix is a tombstone version respected by the reduce.
+- **Private notes re-seal every publish.** A fresh nonce means a new CID even
+  for unchanged content, so the identical-payload saving from §1 never applies —
+  the server can't decrypt remote state to detect what actually changed.
+- **Address is asserted, not bound.** The token proves a live Privy session and
+  the settlement tx proves wallet control, but binding address → DID
+  server-side needs the Privy app secret. Tracked as hardening.
+- **Single instance by design.** Rooms and subscriptions live in one process's
+  memory. See [DEPLOY.md](DEPLOY.md) before scaling out.
+- **No browser tests.** The pure logic has unit tests; view switching, drag and
+  drop, and the editor have none, and those are exactly the places where a
+  broken change reaches a user before it reaches a test.
+
+## Layout and tests
+
+```
+docs/<owner>/<ns>/     working trees (the data)
+  .tree.json           the stored sidebar hierarchy, published as a vertex
+.fangorn/users/*.json  per-user repo store: { active, repos }
+.fangorn/rooms/        Yjs room snapshots, so a room survives eviction
+server/graph.js        files → versioned graph, latest-version reduce
+server/index.js        API, auth, publish prep, live rooms, public read
+server/ydoc.js         markdown ⇄ Yjs, and the read-only frame filter
+src/render.js          markdown → HTML (read pane, Export, public page)
+src/structure.js       pure tree transforms + backlinks
+src/crypto.js          browser-side sealing for private namespaces
+```
 
 ```sh
-mkdir their-wiki && cd their-wiki
-pnpm exec fangorn clone 0x147c24c5Ea2f1EE1ac42AD16820De23bBba45Ef6 fangornmd
-mkdir docs
-pnpm dev            # server boots read-only; click Pull to materialize docs/
+node --test server/ydoc.test.js src/render.test.js
 ```
 
-`clone` just resolves the owner's on-chain tip and writes
-`.fangorn/repo.json` — remember, there are no objects to download until you
-read them, and then they come from IPFS by CID. The app runs identically
-except `writable: false`: no Publish button, but browsing and live sync work,
-because reading and subscribing need no permission from anyone.
-
-To *fork* instead of follow: pull, then `pnpm exec fangorn repo init <your-namespace>`
-and publish under your own root.
-
-## 9. Limitations & where to take it
-
-Honest gaps in v1, roughly in the order they'd be worth fixing:
-
-- **No deletes.** Removing a file drops it from future *edges*, but its latest
-  version still wins the `latestByPath` reduce, so a Pull resurrects it. The
-  fix is a tombstone version (`{ path, deleted: true, updatedAt }`) written on
-  delete and respected by the reduce and the pull.
-- **Last-writer-wins.** Two devices editing the same note race on
-  `updatedAt`; nothing merges. Fangorn gives you both versions and the commit
-  DAG, so three-way merge (or CRDTs in the payload) is buildable — it's app
-  work, not protocol work.
-- **Revision history UI.** Superseded versions are already in the namespace
-  and `GET /api/history` already walks commits; a HackMD-style history drawer
-  is pure frontend.
-- **Mobile.** The frontend is a thin client over nine JSON routes — point a
-  React Native / Capacitor shell at a server running on your LAN or a
-  tailnet. Nothing in `src/` assumes a desktop except the split layout.
-- **Private notes.** Everything published here is public. Fangorn's actual
-  headline feature — zero-knowledge conditional access control — is the
-  natural next chapter: encrypt payloads, gate decryption on a condition.
-
-## Repository layout
-
-```
-docs/               your notes (the working tree — this is the data)
-.fangorn/repo.json  repo pointer: namespace, owner, local tip (like .git/HEAD)
-server/graph.js     files → versioned graph, and the latest-version reduce
-server/index.js     local API: files, publish, pull, history, SSE live sync
-src/                Vite + React editor (App, Editor, api client, SSE hook)
-```
+`ydoc.test.js` exists because the server's markdown ⇄ Slate conversion has to
+agree with the browser's exactly — a drift between them corrupts notes quietly.
+`render.test.js` covers the renderer that produces pages nobody proofreads
+before a stranger sees them.
