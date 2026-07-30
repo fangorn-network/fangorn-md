@@ -290,7 +290,7 @@ function AgentPanel({ repo, onClose }) {
     // In production the server serves this page, so its own origin is the MCP
     // endpoint. In dev the SPA is on Vite (5173) and the server is on 8787, and
     // an agent connects to the server directly rather than through the proxy.
-    const mcpUrl = `${window.location.origin.replace(":5173", ":8787")}/mcp`;
+    const mcpUrl = `${window.location.origin}/mcp`;
 
     const load = useCallback(() => {
         api.tokens().then((r) => setTokens(r.tokens)).catch((e) => setErr(e.message));

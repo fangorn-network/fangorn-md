@@ -12,6 +12,12 @@ export default defineConfig({
                 target: "http://localhost:8787",
                 changeOrigin: true,
             },
+            // So the MCP URL the 🤖 panel prints is just origin + /mcp, in dev
+            // as in prod — including when dev is behind a tunnel.
+            "/mcp": {
+                target: "http://localhost:8787",
+                changeOrigin: true,
+            },
             // Yjs live-collab relay (see server/index.js) — needs WS upgrades.
             "/yjs": {
                 target: "ws://localhost:8787",
