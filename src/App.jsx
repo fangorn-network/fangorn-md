@@ -274,6 +274,98 @@ function CollaboratorPanel({ repo, onSave, onClose }) {
     );
 }
 
+// Owner-only: long-lived tokens an agent holds instead of a browser session.
+// Never able to publish — that needs the wallet, which is here and not wherever
+// the agent is running.
+//
+// The default reaches every wiki you have, so connecting an agent is something
+// you do once rather than once per namespace. Pinning is offered for the token
+// you hand to somebody else's agent, where one wiki is the whole point.
+function AgentPanel({ repo, onClose }) {
+    const [tokens, setTokens] = useState([]);
+    const [name, setName] = useState("");
+    const [pinned, setPinned] = useState(false);
+    const [minted, setMinted] = useState(null); // shown once — only the hash is stored
+    const [err, setErr] = useState(null);
+    // In production the server serves this page, so its own origin is the MCP
+    // endpoint. In dev the SPA is on Vite (5173) and the server is on 8787, and
+    // an agent connects to the server directly rather than through the proxy.
+    const mcpUrl = `${window.location.origin.replace(":5173", ":8787")}/mcp`;
+
+    const load = useCallback(() => {
+        api.tokens().then((r) => setTokens(r.tokens)).catch((e) => setErr(e.message));
+    }, []);
+    useEffect(load, [load]);
+
+    const mint = async (e) => {
+        e.preventDefault();
+        try {
+            setMinted(await api.mintToken(pinned ? repo.namespace : null, name || "agent"));
+            setName("");
+            load();
+        } catch (e2) { setErr(e2.message); }
+    };
+    const revoke = async (hash) => {
+        try { await api.revokeToken(hash); load(); } catch (e2) { setErr(e2.message); }
+    };
+
+    return (
+        <div className="collab-panel">
+            <label className="collab-panel-label">
+                Agent tokens — an agent holding one can read and write your notes, and names which wiki it
+                means per request. Set it up once; new wikis need no new token. It cannot publish: that
+                needs your wallet.
+            </label>
+            <label className="collab-panel-label">
+                <input type="checkbox" checked={pinned} onChange={(e) => setPinned(e.target.checked)} />
+                {" "}Limit this token to <b>{repo.namespace}</b> — for an agent that isn't yours
+            </label>
+            <form className="collab-panel-actions" onSubmit={mint}>
+                <input
+                    className="repo-input"
+                    placeholder="what is this token for? e.g. claude-code"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                />
+                <button className="btn small primary" type="submit">Mint</button>
+                <button className="btn ghost small" type="button" onClick={onClose}>Close</button>
+            </form>
+            {minted && (
+                <div className="agent-token">
+                    <div>Copy it now — it is not stored and cannot be shown again.</div>
+                    <code onClick={() => navigator.clipboard?.writeText(minted.token)}>{minted.token}</code>
+                    <details>
+                        <summary>Connect an agent</summary>
+                        <div>Claude Code:</div>
+                        <pre>{`claude mcp add --transport http fangornmd ${mcpUrl} --header "Authorization: Bearer ${minted.token}"`}</pre>
+                        <div>Anything else that speaks MCP:</div>
+                        <pre>{JSON.stringify({
+                            mcpServers: {
+                                fangornmd: {
+                                    type: "http",
+                                    url: mcpUrl,
+                                    headers: { Authorization: `Bearer ${minted.token}` },
+                                },
+                            },
+                        }, null, 2)}</pre>
+                    </details>
+                </div>
+            )}
+            {tokens.length > 0 && (
+                <ul className="agent-token-list">
+                    {tokens.map((t) => (
+                        <li key={t.hash}>
+                            {t.name} · {t.namespace ?? "all wikis"} · {new Date(t.createdAt).toLocaleDateString()}
+                            <button className="btn ghost small" onClick={() => revoke(t.hash)}>Revoke</button>
+                        </li>
+                    ))}
+                </ul>
+            )}
+            {err && <div className="status err">{err}</div>}
+        </div>
+    );
+}
+
 export default function App({ address, onLogout }) {
     const { getAccessToken } = usePrivy();
     const { wallets } = useWallets();
@@ -326,6 +418,7 @@ export default function App({ address, onLogout }) {
     const [nudges, setNudges] = useState({}); // namespace → last on-chain NamespaceChange
     const [status, setStatus] = useState(null); // { kind: ok|err|busy, text, tx? }
     const [showCollabs, setShowCollabs] = useState(false);
+    const [showAgents, setShowAgents] = useState(false);
     // Off-canvas sidebar; only ever visible on narrow screens (see styles.css).
     const [navOpen, setNavOpen] = useState(false);
     // An incoming share link (?owner=&ns=&note=) — parsed once on mount.
@@ -770,11 +863,23 @@ export default function App({ address, onLogout }) {
                         </button>
                     )}
                     {repo?.isOwner && (
+                        <button
+                            className="btn"
+                            onClick={() => setShowAgents((v) => !v)}
+                            title="Mint a token so an agent can read and write this namespace"
+                        >
+                            🤖
+                        </button>
+                    )}
+                    {repo?.isOwner && (
                         <button className="btn primary" onClick={publish} disabled={status?.kind === "busy"}>
                             Publish
                         </button>
                     )}
                 </header>
+                {showAgents && repo?.isOwner && (
+                    <AgentPanel key={repo.namespace} repo={repo} onClose={() => setShowAgents(false)} />
+                )}
                 {showCollabs && repo?.isOwner && (
                     <CollaboratorPanel
                         key={repo.namespace}

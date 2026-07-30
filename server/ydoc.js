@@ -21,6 +21,23 @@ export const docMarkdown = (xml) => yTextToSlateElement(xml).children.map(nodeTe
 export const seedFromMarkdown = (xml, md) =>
     xml.applyDelta(slateNodesToInsertDelta(toSlateNodes(md)));
 
+/**
+ * Replace a LIVE room's whole text — an agent (or any API write) landing in a
+ * note somebody has open. Writing the file underneath an open room does not
+ * work: the room is authoritative while it exists and flushes its own copy back
+ * over the file, so the write silently disappears. Going through the doc means
+ * the edit shows up in every open editor instead.
+ *
+ * ponytail: replaces the whole text, so a human typing at that instant loses
+ * their cursor and the merge is last-writer-wins on overlapping edits. Diff the
+ * two versions and apply a minimal patch if agents start writing into notes
+ * while people are actively in them.
+ */
+export const replaceMarkdown = (doc, xml, md) => doc.transact(() => {
+    xml.delete(0, xml.length);
+    seedFromMarkdown(xml, md);
+});
+
 // ── surviving an eviction ─────────────────────────────────────────
 // A room only lives as long as someone is in it, but a browser that loses its
 // socket keeps its copy of the document and re-sends it when it reconnects.

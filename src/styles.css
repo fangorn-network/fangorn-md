@@ -246,6 +246,28 @@ body {
 .collab-panel-label { color: var(--text-dim); font-size: 11px; }
 .collab-panel-input { font: 12px/1.6 ui-monospace, monospace; resize: vertical; }
 .collab-panel-actions { display: flex; gap: 6px; }
+
+/* Agent tokens (see AgentPanel in App.jsx). The minted token is shown once. */
+.agent-token { display: flex; flex-direction: column; gap: 6px; font-size: 11px; color: var(--text-dim); }
+.agent-token code {
+    font: 12px/1.5 ui-monospace, monospace;
+    word-break: break-all;
+    cursor: copy;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--text);
+}
+.agent-token pre {
+    font: 11px/1.5 ui-monospace, monospace;
+    overflow-x: auto;
+    padding: 8px;
+    border-radius: 4px;
+    background: var(--bg);
+}
+.agent-token-list { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+.agent-token-list li { display: flex; align-items: center; gap: 8px; padding: 2px 0; color: var(--text-dim); }
 /* Source pane, read pane, or both side by side (see `view` in App.jsx). Either
    pane collapses from the divider between them; the one that's left takes the
    width, and the collapsed one leaves a rail to bring it back. */

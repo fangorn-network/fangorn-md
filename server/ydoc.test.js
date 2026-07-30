@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import * as Y from "yjs";
 import {
-    docMarkdown, seedFromMarkdown, isReadFrame, encodeRoomState, applyRoomState,
+    docMarkdown, seedFromMarkdown, replaceMarkdown, isReadFrame, encodeRoomState, applyRoomState,
 } from "./ydoc.js";
 
 const room = (md) => {
@@ -110,5 +110,20 @@ assert.equal(isReadFrame([1, 0]), true, "awareness must reach the room");
 assert.equal(isReadFrame([0, 0]), true, "syncStep1 must reach the room");
 assert.equal(isReadFrame([0, 1]), false, "syncStep2 would write to the owner's file");
 assert.equal(isReadFrame([0, 2]), false, "an update would write to the owner's file");
+
+// ── an agent writing into a note somebody has open ──
+// The API can't writeFileSync under a live room (the room flushes back over
+// it), so the write goes through the doc — and every peer has to see it.
+{
+    const owner = room("# Notes\n\ndraft");
+    const peer = room();
+    sync(owner, peer);
+
+    replaceMarkdown(owner.doc, owner.xml, "# Notes\n\nrewritten by an agent\n");
+    sync(owner, peer);
+    assert.equal(docMarkdown(peer.xml), "# Notes\n\nrewritten by an agent\n",
+        "the agent's write never reached the person with the note open");
+    assert.equal(docMarkdown(owner.xml), docMarkdown(peer.xml), "the room disagrees with itself");
+}
 
 console.log("ydoc: ok");

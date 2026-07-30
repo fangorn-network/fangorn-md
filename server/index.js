@@ -3,13 +3,16 @@ import {
     readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, watch, rmSync, renameSync,
 } from "node:fs";
 import { join, dirname, extname, normalize } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
 import { Fangorn, FangornConfig, appId, extractMarkdownLinks } from "@fangorn-network/sdk";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { WebSocketServer } from "ws";
 import { setupWSConnection, setPersistence, docs as yRooms } from "@y/websocket-server/utils";
 import * as Y from "yjs";
-import { docMarkdown, seedFromMarkdown, isReadFrame, encodeRoomState, applyRoomState } from "./ydoc.js";
+import { docMarkdown, seedFromMarkdown, replaceMarkdown, isReadFrame, encodeRoomState, applyRoomState } from "./ydoc.js";
 import { buildWikiGraph, latestByPath, latestEdges } from "./graph.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createFangornmdServer, httpCall } from "../mcp/tools.js";
 // Shared with the browser: one renderer for the pane, the export and the
 // published page, so a public URL can't drift from what the author saw.
 import { publicPage } from "../src/render.js";
@@ -98,8 +101,49 @@ class HttpError extends Error {
     constructor(status, message) { super(message); this.status = status; }
 }
 
+// ─── Auth (agent tokens) ────────────────────────────────────────────────────
+//
+// A Privy JWT proves a live browser session, which an agent can't have. So an
+// owner can mint a long-lived token their agent holds instead:
+//
+//     fmd_<owner address>_<random>
+//
+// The address is IN the token so a lookup is one file read — no index, no scan
+// across every user. Only the sha256 is stored, so the user file is not itself
+// a credential; the token is shown once at mint time.
+//
+// A token reaches every namespace its owner tracks, and the caller names which
+// one per request (`?ns=`). Connecting an agent is then a ONE-TIME setup rather
+// than one endpoint per wiki — which matters, because a per-namespace token
+// means re-configuring every MCP client each time someone makes a new wiki, and
+// nobody does that.
+//
+// `namespace` on the record optionally PINS a token to one wiki. Then `?ns=`
+// can't move it, and the token is worth exactly one namespace if it leaks. It's
+// the right default for a token you hand to somebody else's agent, and the
+// wrong one for your own, so the browser offers both and defaults to unpinned.
+//
+// What no token may do, pinned or not: mint tokens, and publish. Note that
+// `agent` is tracked separately from `agentNs` — an unpinned token has no
+// namespace, and if that were the agent test, an unpinned token would read as a
+// browser session and could publish. Publishing is refused here for tidiness
+// anyway: settling is a transaction signed by the owner's wallet, which lives
+// in their browser and not on this server. That is the real boundary; this
+// check is just the polite error.
+const hashToken = (t) => createHash("sha256").update(t).digest("hex");
+
+function agentAuth(token) {
+    const [, address] = token.match(/^fmd_(0x[0-9a-f]{40})_[0-9a-f]+$/i) ?? [];
+    if (!address) return null;
+    const rec = readUserState(address.toLowerCase()).tokens?.[hashToken(token)];
+    if (!rec) throw new HttpError(401, "unknown or revoked agent token");
+    return { address: address.toLowerCase(), agent: true, agentNs: rec.namespace ?? null };
+}
+
 async function authenticate(token, assertedAddress) {
     if (!token) throw new HttpError(401, "missing auth token");
+    const agent = agentAuth(token);
+    if (agent) return agent;
     try {
         await jwtVerify(token, JWKS, { issuer: "privy.io", audience: PRIVY_APP_ID });
     } catch {
@@ -107,8 +151,12 @@ async function authenticate(token, assertedAddress) {
     }
     const address = String(assertedAddress ?? "").toLowerCase();
     if (!/^0x[0-9a-f]{40}$/.test(address)) throw new HttpError(400, "missing or invalid X-Wallet-Address");
-    return address;
+    return { address, agent: false, agentNs: null };
 }
+
+const assertHuman = (p) => {
+    if (p.agent) throw new HttpError(403, "agent tokens cannot do this — a human must, from the browser");
+};
 
 // ─── Per-user repo store ────────────────────────────────────────────────────
 //
@@ -160,8 +208,57 @@ function userStore(address) {
             s.repos[ns].collaborators = list;
             write(s);
         },
+        // Agent tokens, keyed by hash. `name` is for the human's list; the token
+        // itself is returned once by mint() and never stored.
+        tokens: () => Object.entries(read().tokens ?? {})
+            .map(([hash, t]) => ({ hash, name: t.name, namespace: t.namespace, createdAt: t.createdAt })),
+        // `namespace` null → the token reaches every repo this user tracks.
+        mintToken(name, namespace) {
+            const s = read();
+            if (namespace && !s.repos[namespace]) throw new HttpError(404, `no such repo: ${namespace}`);
+            const token = `fmd_${address}_${randomBytes(24).toString("hex")}`;
+            s.tokens = { ...s.tokens, [hashToken(token)]: { name, namespace, createdAt: Date.now() } };
+            write(s);
+            return token;
+        },
+        revokeToken(hash) {
+            const s = read();
+            if (!s.tokens?.[hash]) throw new HttpError(404, "no such token");
+            delete s.tokens[hash];
+            write(s);
+        },
     };
 }
+
+// The repo a request operates on. An agent token is pinned to its namespace;
+// a browser session follows the user's active repo. Every note route goes
+// through here, so the scope holds everywhere by construction.
+// The live Yjs doc for a note, if anyone has it open right now. While it
+// exists it — not the file — is the current text: it seeds from disk once and
+// then flushes back on a debounce. So an API read/write has to go through it
+// or it is reading stale text and writing text that gets overwritten.
+function openRoom(repo, note) {
+    const doc = yRooms.get(`${repo.owner}:${repo.namespace}:${note}`);
+    return doc ? { doc, xml: doc.get("content", Y.XmlText) } : null;
+}
+
+// Which repo a request acts on:
+//   pinned token  → its namespace, and `?ns=` may only agree with it
+//   otherwise     → `?ns=` if given, else the user's active repo
+// A browser never sends `?ns=`, so the human keeps following their own tabs.
+const repoForOrNull = (p) => {
+    const store = userStore(p.address);
+    if (p.agentNs) {
+        if (p.ns && p.ns !== p.agentNs) throw new HttpError(403, `this token is pinned to ${p.agentNs}`);
+        return store.get(p.agentNs);
+    }
+    return p.ns ? store.get(p.ns) : store.activeOrNull();
+};
+const repoFor = (p) => {
+    const repo = repoForOrNull(p);
+    if (!repo) throw new HttpError(404, "no active repo — create one first");
+    return repo;
+};
 
 const docsDir = (repo) => join(DATA_DIR, repo.dir);
 // `writable` = may edit the working tree (owner or collaborator).
@@ -310,7 +407,7 @@ async function remoteState(repo) {
 
 async function handleEvents(req, res, url) {
     let address;
-    try { address = await authenticate(url.searchParams.get("token"), url.searchParams.get("address")); }
+    try { ({ address } = await authenticate(url.searchParams.get("token"), url.searchParams.get("address"))); }
     catch { res.writeHead(401); return res.end(); }
 
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
@@ -364,9 +461,9 @@ const routes = {
         return { active: state.active, address, repos: s.list().map((r) => publicRepo(r, address)) };
     },
 
-    "GET /api/repo": async ({ address }) => {
-        const repo = userStore(address).activeOrNull();
-        return repo ? publicRepo(repo, address) : null;
+    "GET /api/repo": async (p) => {
+        const repo = repoForOrNull(p);
+        return repo ? publicRepo(repo, p.address) : null;
     },
 
     // Create a repo LOCALLY — no on-chain tx. The namespace is allocated on-chain
@@ -401,7 +498,12 @@ const routes = {
         return publicRepo(s.active(), address);
     },
 
-    "POST /api/repos/active": async ({ address, body }) => {
+    // Browser-only: this moves the human's UI. An agent names its target with
+    // `?ns=` per call instead, so it never has a reason to reach for this —
+    // and can't yank someone's editor to another wiki mid-sentence.
+    "POST /api/repos/active": async (p) => {
+        assertHuman(p);
+        const { address, body } = p;
         const s = userStore(address);
         s.setActive(String(body.namespace ?? ""));
         return publicRepo(s.active(), address);
@@ -421,11 +523,37 @@ const routes = {
         return publicRepo(s.get(namespace), address);
     },
 
+    // ── Agent tokens (browser-only: an agent cannot mint itself more reach) ──
+    "GET /api/tokens": async (p) => {
+        assertHuman(p);
+        return { tokens: userStore(p.address).tokens() };
+    },
+
+    "POST /api/tokens": async (p) => {
+        assertHuman(p);
+        // No namespace = every wiki this user tracks, which is what makes
+        // connecting an agent a one-time step rather than a per-wiki one.
+        const namespace = String(p.body.namespace ?? "").trim() || null;
+        const name = String(p.body.name ?? "agent").trim().slice(0, 64) || "agent";
+        if (namespace && userStore(p.address).get(namespace).owner !== p.address) {
+            throw new HttpError(403, "not your repo — pin a token to a namespace you own");
+        }
+        // Returned ONCE. Only the hash is stored, so this is the only moment the
+        // token exists anywhere we can show it.
+        return { token: userStore(p.address).mintToken(name, namespace), name, namespace };
+    },
+
+    "POST /api/tokens/revoke": async (p) => {
+        assertHuman(p);
+        userStore(p.address).revokeToken(String(p.body.hash ?? ""));
+        return { revoked: true };
+    },
+
     // ── Notes (operate on the active repo's dir) ──
     // Returns the notes plus the explicit page `tree`. Per-note `links` are the
     // markdown [[wikilinks]] — kept only for backlinks/navigation, not structure.
-    "GET /api/notes": async ({ address }) => {
-        const repo = userStore(address).activeOrNull();
+    "GET /api/notes": async (p) => {
+        const repo = repoForOrNull(p);
         if (!repo) return { notes: [], tree: [] };
         const dir = docsDir(repo);
         const paths = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".md")) : [];
@@ -439,30 +567,47 @@ const routes = {
     },
 
     // Drag-and-drop persisted the reordered hierarchy.
-    "PUT /api/tree": async ({ address, body }) => {
-        const repo = userStore(address).active();
+    "PUT /api/tree": async (p) => {
+        const { address, body } = p;
+        const repo = repoFor(p);
         if (!canEdit(repo, address)) throw new HttpError(403, "read-only — ask the owner to add you as a collaborator");
         if (!Array.isArray(body.tree)) throw new HttpError(400, "tree array required");
         writeTree(repo, body.tree);
         return { tree: reconcileTree(repo).tree };
     },
 
-    "GET /api/notes/:path": async ({ address, path }) => {
-        const file = join(docsDir(userStore(address).active()), path);
+    // Both of these prefer the LIVE room over the file when one is open — see
+    // openRoom(). The file lags a room by up to FLUSH_MS, and a plain
+    // writeFileSync into a note somebody has open is erased by the next flush.
+    "GET /api/notes/:path": async (p) => {
+        const { path } = p;
+        const repo = repoFor(p);
+        const live = openRoom(repo, path);
+        if (live) return { path, content: docMarkdown(live.xml), live: true };
+        const file = join(docsDir(repo), path);
         if (!existsSync(file)) throw new HttpError(404, `no such note: ${path}`);
-        return { path, content: readFileSync(file, "utf-8") };
+        return { path, content: readFileSync(file, "utf-8"), live: false };
     },
 
-    "PUT /api/notes/:path": async ({ address, path, body }) => {
+    "PUT /api/notes/:path": async (p) => {
+        const { path, body } = p;
         if (typeof body.content !== "string") throw new HttpError(400, "content required");
-        const dir = docsDir(userStore(address).active());
+        const repo = repoFor(p);
+        const live = openRoom(repo, path);
+        if (live) {
+            replaceMarkdown(live.doc, live.xml, body.content);
+            live.doc.flushToDisk?.(); // don't wait out the debounce to answer "saved"
+            return { path, saved: true, live: true };
+        }
+        const dir = docsDir(repo);
         if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
         writeFileSync(join(dir, path), body.content, "utf-8");
-        return { path, saved: true };
+        return { path, saved: true, live: false };
     },
 
-    "DELETE /api/notes/:path": async ({ address, path }) => {
-        const repo = userStore(address).active();
+    "DELETE /api/notes/:path": async (p) => {
+        const { address, path } = p;
+        const repo = repoFor(p);
         if (!canEdit(repo, address)) throw new HttpError(403, "read-only — ask the owner to add you as a collaborator");
         const file = join(docsDir(repo), path);
         if (!existsSync(file)) throw new HttpError(404, `no such note: ${path}`);
@@ -474,8 +619,9 @@ const routes = {
 
     // Rename in place: move the file and rewrite its path throughout the tree.
     // Existing [[wikilinks]] to the old name are left as-is (navigation only).
-    "POST /api/notes/:path/rename": async ({ address, path, body }) => {
-        const repo = userStore(address).active();
+    "POST /api/notes/:path/rename": async (p) => {
+        const { address, path, body } = p;
+        const repo = repoFor(p);
         if (!canEdit(repo, address)) throw new HttpError(403, "read-only — ask the owner to add you as a collaborator");
         let to = String(body.to ?? "").trim();
         if (!to.endsWith(".md")) to += ".md";
@@ -492,8 +638,8 @@ const routes = {
         return { path: to };
     },
 
-    "GET /api/remote": async ({ address }) => {
-        const repo = userStore(address).active();
+    "GET /api/remote": async (p) => {
+        const repo = repoFor(p);
         const { contents, latest } = await remoteState(repo);
         const notes = [...latest.entries()].map(([path, v]) => ({
             path, cid: v.cid,
@@ -503,8 +649,9 @@ const routes = {
         return { notes, edges: latestEdges(contents, latest) };
     },
 
-    "POST /api/pull": async ({ address }) => {
-        const repo = userStore(address).active();
+    "POST /api/pull": async (p) => {
+        const { address } = p;
+        const repo = repoFor(p);
         // A collaborator already lives in the owner's live tree — pulling would
         // overwrite everyone's in-flight drafts with the last published snapshot.
         if (repo.owner !== address && canEdit(repo, address)) return { written: [], skippedEncrypted: [], shared: true };
@@ -529,7 +676,9 @@ const routes = {
     // ── Self-custodial publish: prepare (keyless, server) → sign+send (browser)
     //    → settle (record head). The server builds and flushes the commit but
     //    NEVER signs; it hands back the unsigned settlement tx.
-    "POST /api/publish/prepare": async ({ address, body }) => {
+    "POST /api/publish/prepare": async (p) => {
+        assertHuman(p); // the tx this returns can only be signed in a browser anyway
+        const { address, body } = p;
         const repo = body.namespace ? userStore(address).get(body.namespace) : userStore(address).active();
         if (repo.owner !== address) throw new HttpError(403, "not your repo — only the owner's wallet can publish");
 
@@ -594,7 +743,9 @@ const routes = {
     },
 
     // Record the settled head after the browser's tx confirms.
-    "POST /api/settle": async ({ address, body }) => {
+    "POST /api/settle": async (p) => {
+        assertHuman(p);
+        const { address, body } = p;
         const namespace = String(body.namespace ?? "");
         const repo = userStore(address).get(namespace);
         if (repo.owner !== address) throw new HttpError(403, "not your repo");
@@ -602,8 +753,8 @@ const routes = {
         return { ok: true, head: body.commitCid ?? null, txHash: body.txHash ?? null };
     },
 
-    "GET /api/history": async ({ address }) => {
-        const { head } = userStore(address).active();
+    "GET /api/history": async (p) => {
+        const { head } = repoFor(p);
         if (!head) return { commits: [] };
         const commits = [];
         for await (const c of fangorn.log(head, 50)) commits.push(c);
@@ -673,6 +824,39 @@ async function servePublic(req, res, pathname) {
     }));
 }
 
+// ─── MCP over HTTP ──────────────────────────────────────────────────────────
+//
+// The same five tools as mcp/fangornmd.js, on the server that is already
+// hosted. This is how anyone other than the person with the checkout uses it:
+//
+//   claude mcp add --transport http fangornmd https://host/mcp \
+//     --header "Authorization: Bearer fmd_0x…"
+//
+// No install, no Node on the agent's side, nothing to distribute or keep in
+// version step — the tools ship with the server, so every user of an instance
+// gets whatever that instance is running.
+//
+// Stateless: one server + transport per request, no session ids. An agent
+// token already identifies the caller on every call, so a session would be a
+// second, weaker identity to keep in sync with the first.
+//
+// The tools reach the API the same way an outside client would — an HTTP call
+// to this process carrying the caller's own token — rather than calling the
+// route handlers directly. It costs a loopback request per tool call, which is
+// nothing at this scale, and buys the guarantee that MCP cannot become a way
+// around a rule the HTTP API enforces.
+async function handleMcp(req, res) {
+    const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+    if (!token) return sendJson(res, 401, { error: "missing agent token — mint one in the browser (🤖) and send it as `Authorization: Bearer`" });
+
+    const base = `http://127.0.0.1:${PORT}`;
+    const server = createFangornmdServer({ call: httpCall(base, token), base });
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    res.on("close", () => { transport.close(); server.close(); });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.method === "POST" ? await readJson(req) : undefined);
+}
+
 // ─── Static SPA (production) ────────────────────────────────────────────────
 
 const DIST = join(ROOT, "dist");
@@ -694,6 +878,10 @@ function serveStatic(res, pathname) {
 const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
+    if (url.pathname === "/mcp") {
+        try { return await handleMcp(req, res); }
+        catch (err) { console.error(err); return sendJson(res, 500, { error: err.message }); }
+    }
     if (req.method === "GET" && url.pathname === "/api/events") return handleEvents(req, res, url);
     if (req.method === "GET" && url.pathname.startsWith(PUBLIC_PREFIX)) {
         // Unauthenticated and reaching the network — its own try//catch, so a
@@ -704,7 +892,9 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && !url.pathname.startsWith("/api/")) return serveStatic(res, url.pathname);
 
     let key = `${req.method} ${url.pathname}`;
-    const params = {};
+    // `?ns=` lets one agent token address every wiki its owner has, naming the
+    // target per call instead of carrying it in the credential.
+    const params = { ns: url.searchParams.get("ns") || null };
     const renameMatch = url.pathname.match(/^\/api\/notes\/(.+)\/rename$/);
     const noteMatch = url.pathname.match(/^\/api\/notes\/(.+)$/);
     if (renameMatch) {
@@ -720,7 +910,7 @@ const server = createServer(async (req, res) => {
 
     try {
         const bearer = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-        params.address = await authenticate(bearer, req.headers["x-wallet-address"]);
+        Object.assign(params, await authenticate(bearer, req.headers["x-wallet-address"]));
         if (params.path) assertNotePath(params.path);
         if (req.method === "PUT" || req.method === "POST") params.body = await readJson(req);
         sendJson(res, 200, await handler(params));
@@ -885,7 +1075,7 @@ server.on("upgrade", async (req, socket, head) => {
     const deny = (line) => { socket.write(`HTTP/1.1 ${line}\r\n\r\n`); socket.destroy(); };
 
     let address;
-    try { address = await authenticate(url.searchParams.get("token"), url.searchParams.get("address")); }
+    try { ({ address } = await authenticate(url.searchParams.get("token"), url.searchParams.get("address"))); }
     catch { return deny("401 Unauthorized"); }
 
     const docName = decodeURIComponent(url.pathname.slice("/yjs/".length));
@@ -908,4 +1098,5 @@ server.listen(PORT, () => {
     console.log(`  service: ${fangorn.getAddress()} (engine + Pinata only)`);
     console.log(`  app:     fangornmd ${APP_ID} (owner ${appOwner})`);
     console.log(`  privy:   ${PRIVY_APP_ID}`);
+    console.log(`  mcp:     POST /mcp (agent token as Bearer)`);
 });

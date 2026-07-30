@@ -7,7 +7,7 @@ content-addressed graph settled on-chain (Arbitrum Sepolia), with blocks pinned
 to IPFS. Anyone can then follow your wiki by address + namespace, read it, and
 live-sync as you push updates.
 
-Two properties are the whole point, and they're why this isn't a worse Google
+Three properties are the whole point, and they're why this isn't a worse Google
 Drive:
 
 - **Self-custodial.** The server holds no user keys. Every on-chain settlement
@@ -17,6 +17,11 @@ Drive:
   that exists independently of this server. A reader can see who signed a page
   and the exact hash of what they're reading, which is something a link to a
   hosted doc can never tell them.
+- **Agents can write here, and cannot publish.** An agent gets a scoped token
+  and full run of the working tree — it even types into notes you have open,
+  live. It can never make anything public, because publishing is a transaction
+  signed by a wallet in your browser. The human in the loop is a key, not a
+  confirmation dialog (§11).
 
 This README doubles as the **dev guide**: it builds the app up from a single
 graph-building function, and explains each design decision in terms of what the
@@ -44,11 +49,74 @@ Fangorn SDK actually does. Deployment lives in [DEPLOY.md](DEPLOY.md).
 | Working trees | `docs/<owner>/<ns>/*.md` | The notes. Plain files — edit them with anything. |
 | Relay + API | [server/index.js](server/index.js), [server/graph.js](server/graph.js), [server/ydoc.js](server/ydoc.js) | Files, publish prep, pull, live rooms, change feed, public read. |
 | Editor | [src/](src/) | Slate-based markdown editor talking to the server over HTTP, SSE and WebSocket. |
+| Agent bridge | [mcp/tools.js](mcp/tools.js) | Five MCP tools, served at `POST /mcp` and over stdio. |
 
 The browser never touches the SDK directly — it needs Node (block cache, LMDB,
 gateway access) — so all Fangorn work happens server-side and the frontend
 stays a replaceable client. The one thing the server deliberately *cannot* do
 is sign for a user.
+
+---
+
+## Quickstart
+
+**Run it.** Needs Node ≥ 20.19, [pnpm](https://pnpm.io), a
+[Privy](https://dashboard.privy.io) app id, a throwaway EVM key (no funds), and
+a [Pinata](https://pinata.cloud) gateway domain. Details and why in §2.
+
+```sh
+pnpm install
+cp .env.example .env      # ETH_PRIVATE_KEY, PINATA_GATEWAY, VITE_PRIVY_APP_ID
+pnpm dev                  # API server (:8787) + Vite (:5173)
+```
+
+Open http://localhost:5173 → log in → **+ New** a namespace → write. Notes are
+plain files at `docs/<your address>/<namespace>/*.md`; nothing is on-chain yet.
+
+**Publish.** Hit **Publish** and sign in your wallet. Now `🔗 Share` gives a
+link anyone can open — no account — and the page carries your signing address
+and the content hash of exactly what they're reading.
+
+**Point an agent at it.** Click **🤖** in the header, mint a token — the panel
+prints the exact command with the token already in it. In Claude Code that is:
+
+```sh
+claude mcp add --transport http fangornmd http://drive.fangorn.network/mcp --header "Authorization: Bearer fmd_0x…"
+```
+
+Or the equivalent JSON for Claude Desktop / any other MCP client:
+
+```json
+{ "mcpServers": { "fangornmd": {
+    "type": "http", "url": "http://localhost:8787/mcp",
+    "headers": { "Authorization": "Bearer fmd_0x…" } } } }
+```
+
+The MCP server **is** the fangornmd server — nothing separate to install, host,
+or keep in version step. Swap in your own origin once it's deployed and it works
+from anywhere, including clients that can't run Node. (A stdio server at
+[mcp/fangornmd.js](mcp/fangornmd.js) remains for hacking on a checkout; §11.)
+
+Ask it to *"read my wiki and write a summary note"*. Six tools: `list_wikis`,
+`list_notes`, `read_note`, `write_note`, `repo_info`, `read_published`.
+
+You do this **once**. The token reaches every wiki you have, including ones you
+create later — the agent names which it means per call, and defaults to the one
+open in your browser.
+
+**Then leave a note open in the browser and ask the agent to rewrite it.** You
+will watch it type into your editor. That is the part worth seeing — §11 for
+why it works that way, and what it still gets wrong.
+
+**Two things the agent cannot do:** publish, and mint itself more tokens. Both
+are refused by the server, and publishing is unreachable regardless — it needs
+your wallet.
+
+Running tests:
+
+```sh
+node --test server/ydoc.test.js src/render.test.js
+```
 
 ---
 
@@ -166,9 +234,12 @@ to its children, and those parent → child pairs are the only edges published.
 [server/index.js](server/index.js) is a plain `node:http` server, no framework.
 
 Auth is a Privy access token (verified against Privy's JWKS) plus an asserted
-wallet address. The assertion is safe because it's the *settlement transaction*
-that authenticates a publish on-chain: you can stage under any address, but you
-can only settle from the wallet you hold.
+wallet address, **or** an agent token (§11) — one `authenticate()` returning
+`{ address, agentNs }`, so every route below is reachable by both and the
+difference is a namespace scope rather than a parallel API. The assertion is
+safe because it's the *settlement transaction* that authenticates a publish
+on-chain: you can stage under any address, but you can only settle from the
+wallet you hold.
 
 State is one file per user at `.fangorn/users/<address>.json` — no shared
 mutable state between users.
@@ -178,25 +249,33 @@ mutable state between users.
 | `GET /api/repos` · `GET /api/repo` | Every tracked namespace / the active one |
 | `POST /api/repos` | Create a namespace (`public` or `private`) |
 | `POST /api/repos/follow` | Track someone else's namespace, read-only |
-| `POST /api/repos/active` | Switch namespace |
+| `POST /api/repos/active` | Switch namespace — **browser only** |
 | `PUT /api/collaborators` | Owner-only: who else may edit the working tree |
+| `GET`/`POST /api/tokens` · `POST /api/tokens/revoke` | Agent tokens — **browser only** (§11) |
+| `POST /mcp` | MCP over HTTP, agent token as Bearer (§11) |
 | `GET /api/notes` | List notes + the stored tree |
-| `GET`/`PUT`/`DELETE /api/notes/:path` | Read / write / delete one note |
+| `GET`/`PUT`/`DELETE /api/notes/:path` | Read / write / delete one note — through the live room if one is open (§7) |
+| *(any note route)* `?ns=` | Act on a named wiki instead of the active one (§11) |
 | `POST /api/notes/:path/rename` | Move a note, rewriting it through the tree |
 | `PUT /api/tree` | Persist the drag-and-drop hierarchy |
 | `GET /api/remote` | Latest published version of every note, plus edges |
 | `POST /api/pull` | Materialize published versions into the working tree |
-| `POST /api/publish/prepare` | Build + pin the commit, return an **unsigned** tx |
-| `POST /api/settle` | Record the head after the browser's tx confirms |
+| `POST /api/publish/prepare` | Build + pin the commit, return an **unsigned** tx — **browser only** |
+| `POST /api/settle` | Record the head after the browser's tx confirms — **browser only** |
 | `GET /api/history` | Walk commits from the current head |
 | `GET /api/events` | SSE: `local-change` + `remote-change` |
 | `GET /r/:owner/:ns/:note.md` | **Public read — no auth** (§10) |
+
+Which repo a request acts on comes from `repoFor()`: a pinned token gets its
+namespace and nothing else, anyone else gets `?ns=` if they sent one and the
+active repo otherwise. One helper, so the rule holds on every note route by
+construction rather than by remembering.
 
 **Collaborators work in the owner's directory** — same files, same
 `.tree.json`. The alternative, giving each collaborator their own copy, means a
 friend's edits never reach the tree the owner publishes. One shared tree makes
 "the owner publishes what we all wrote" true by construction. Someone who only
-follows a namespace (§11) gets their own copy instead, since they never write
+follows a namespace (§12) gets their own copy instead, since they never write
 to it.
 
 Note paths are validated against `^[\w][\w .-]*\.md$`. A namespace is a display
@@ -221,7 +300,7 @@ source pane to keep in sync.
 - **Images** — pasted or dropped, inlined as data-URIs, capped at 1 MB. No
   upload endpoint and no blob store, so a note stays one self-contained `.md`
   that survives publish → pull → sync unchanged. This is the main thing
-  blocking "real" documents; see §13.
+  blocking "real" documents; see §14.
 - **Rendering** — [src/render.js](src/render.js) is a small hand-written
   markdown → HTML renderer shared by the read pane, Export, and the public page.
   Nothing from a note reaches the output unescaped, and only `http(s):`,
@@ -282,6 +361,13 @@ outlives the file it mirrors: its debounced flush, and the write triggered when
 the last peer leaves, would both re-create the note at the old path — leaving a
 rename with a copy under each name.
 
+**The room, not the file, is the current text.** This is the rule the API has to
+respect too. While a room exists the file lags it by up to `FLUSH_MS`, so
+reading the file returns stale text, and writing the file is erased by the next
+flush. `openRoom()` sends `GET`/`PUT /api/notes/:path` through the doc instead
+whenever one is open — which is what lets an agent write into a note you are
+looking at (§11) rather than into a file that is about to be overwritten.
+
 Private namespaces never open a room: their content is ciphertext the server
 can't read, and a live plaintext room would defeat that.
 
@@ -337,7 +423,90 @@ route.
   otherwise this server becomes an open gateway for the whole network.
 - Working-tree drafts are never served. Publishing is deliberate.
 
-## 11. Following and sharing
+## 11. Agents: tokens and MCP
+
+§10 lets an agent *read* what's published. Writing needs a credential, and a
+Privy JWT proves a live browser session an agent can't have. So an owner mints
+an **agent token** (🤖 in the header):
+
+```
+fmd_<owner address>_<random>
+```
+
+- The address is in the token, so resolving it is one file read — no index, no
+  scan across users. Only its sha256 is stored; it's shown once at mint.
+- **One token, every wiki.** A token reaches each namespace its owner tracks,
+  and the caller names the target per request (`?ns=`, or the `namespace`
+  argument on the MCP tools). Connecting an agent is therefore a one-time step:
+  make a new wiki and the existing token already reaches it. A per-namespace
+  credential would mean re-configuring every MCP client each time someone
+  creates a wiki, which nobody does.
+- **Pinning is opt-in.** A token may be fixed to one namespace at mint, and then
+  `?ns=` cannot move it. That's the right default for a token you hand to
+  *someone else's* agent, and the wrong one for your own — so the 🤖 panel
+  offers both and defaults to unpinned.
+- **`?ns=` is never the human's problem.** The browser doesn't send it, so a
+  person keeps following their own tabs, and `POST /api/repos/active` is
+  browser-only: an agent has no reason to switch the active repo when it can
+  name its target per call, and so it can't yank an editor to another wiki
+  mid-sentence.
+- **Cannot publish, cannot mint.** `assertHuman()` refuses both, keyed on an
+  `agent` flag rather than on the presence of a namespace scope — an unpinned
+  token has no namespace, and testing the scope would let it pass as a browser
+  session. The publish refusal is only the polite error: settling is a
+  transaction signed by the owner's wallet, in their browser. The server has no
+  key to sign it with and neither does the agent. **The human in the loop is a
+  key, not a dialog** — there is nothing an agent can be talked into clicking.
+
+Six tools — `list_wikis`, `list_notes`, `read_note`, `write_note`, `repo_info`,
+`read_published` — defined once in [mcp/tools.js](mcp/tools.js) and served over
+two transports:
+
+| Transport | Where | For |
+|---|---|---|
+| **HTTP** | `POST /mcp` on this server | Everyone. Nothing to install — an agent needs a URL and a token, not a checkout, Node, or a copy of this repo. |
+| stdio | [mcp/fangornmd.js](mcp/fangornmd.js) | Hacking on a checkout. |
+
+Hosting the MCP server separately would be a second deployment to run, secure
+and keep in version step with an API it is a strict subset of. It's a route
+instead, so every user of an instance gets exactly what that instance is
+running. Wiring it up: [Quickstart](#quickstart).
+
+`/mcp` is **stateless** — one MCP server and transport per request, no session
+ids. The agent token already identifies the caller on every call, so a session
+would be a second, weaker identity to keep in step with the first.
+
+The tools reach the API the way any outside client would, over a loopback HTTP
+request carrying the caller's own token, rather than calling route handlers
+directly. That costs one local request per tool call — nothing at this scale —
+and buys the guarantee that MCP can never become a way around a rule the HTTP
+API enforces. Same reason the tool file holds no logic of its own: a rule there
+is a rule an agent skips by calling the API directly.
+
+**A hosted token crosses the network on every call, so serve `/mcp` over TLS.**
+Namespace scoping already bounds what a leaked one reaches, and Revoke is in the
+🤖 panel; token expiry is the next thing worth adding, and only then.
+
+**Reads and writes go through the live room, not the file.** While anyone has a
+note open, the Yjs doc is the current text and the file lags it by up to
+`FLUSH_MS` — so `writeFileSync` under an open room is erased by the next flush,
+and reading the file returns stale text. `openRoom()` catches both: an agent
+writing a note you have open appears in your editor as it types
+(`replaceMarkdown`), and `read_note` returns what's on your screen including
+your unsaved edits. That's the beginning of the interesting thing — agent and
+human in one buffer rather than trading files.
+
+`read_published` returns the markdown **and the CID it was served under**. An
+agent citing that CID is making a claim a second agent can check against the
+chain, independently of this server. Nothing else in an agent's toolbox does
+that.
+
+What this does *not* do yet: an agent write replaces the whole note, and its
+edits arrive unattributed — see the first two bullets of §14. Both matter the
+moment a human and an agent are in the same paragraph at the same time, which
+is the case worth designing for.
+
+## 12. Following and sharing
 
 A wiki is fully identified by `(owner address, namespace)`. **Share** copies a
 link carrying both; opening it offers to subscribe, pull, and open the note.
@@ -351,7 +520,7 @@ the namespaces it tracks. The UI shows a banner; **Pull is explicit**, because
 auto-applying remote changes to a directory a human also edits is how you eat
 someone's work.
 
-## 12. Performance
+## 13. Performance
 
 Publish logs its phases. Expect the first operation after boot to be slow — a
 cold namespace walk is one sequential gateway fetch per block — and everything
@@ -364,13 +533,22 @@ If publish is consistently slow, the log says which phase: a slow read means
 the tip cache isn't being hit; a slow commit+flush means many new blocks or a
 struggling uplink; a slow settle is the RPC endpoint or consensus.
 
-## 13. Limitations & where to take it
+## 14. Limitations & where to take it
 
 Roughly in the order they're worth fixing:
 
 - **No blob storage.** Images are data-URIs capped at 1 MB, which rules out
   real documents and means any future "import from Google Docs / Dropbox"
   arrives with broken images. This is the next structural piece.
+- **Agent writes replace the whole note.** `replaceMarkdown` clears the doc and
+  re-seeds it, so an agent writing while you type costs you your cursor and
+  resolves overlapping edits last-writer-wins. Fine for "rewrite this note",
+  wrong for "you two work on this paragraph together" — that needs a diff and a
+  minimal patch. Marked in [server/ydoc.js](server/ydoc.js).
+- **Agent edits are unattributed.** Yjs already knows which client inserted
+  which characters; nothing renders it. An agent whose edits arrive visibly
+  marked and provisional is a different tool than one that silently rewrites
+  your paragraph, and the data to do it is already in the room.
 - **No deletes on-chain.** Removing a file drops it from future edges, but its
   latest version still wins the `latestByPath` reduce, so a pull can resurrect
   it. The fix is a tombstone version respected by the reduce.
@@ -391,11 +569,13 @@ Roughly in the order they're worth fixing:
 ```
 docs/<owner>/<ns>/     working trees (the data)
   .tree.json           the stored sidebar hierarchy, published as a vertex
-.fangorn/users/*.json  per-user repo store: { active, repos }
+.fangorn/users/*.json  per-user repo store: { active, repos, tokens }
 .fangorn/rooms/        Yjs room snapshots, so a room survives eviction
 server/graph.js        files → versioned graph, latest-version reduce
 server/index.js        API, auth, publish prep, live rooms, public read
 server/ydoc.js         markdown ⇄ Yjs, and the read-only frame filter
+mcp/tools.js           the five MCP tools, shared by both transports
+mcp/fangornmd.js       stdio MCP entry point (HTTP lives at POST /mcp)
 src/render.js          markdown → HTML (read pane, Export, public page)
 src/structure.js       pure tree transforms + backlinks
 src/crypto.js          browser-side sealing for private namespaces

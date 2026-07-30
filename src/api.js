@@ -64,6 +64,12 @@ export const api = {
             headers: await authHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify({ tree }),
         }).then(json),
+    // Agent tokens: long-lived credentials for an MCP client (see mcp/fangornmd.js).
+    // The token itself comes back only from mint — the server stores its hash.
+    tokens: () => get("/api/tokens"),
+    // namespace null → the token reaches every wiki this user tracks.
+    mintToken: (namespace, name) => post("/api/tokens", { namespace, name }),
+    revokeToken: (hash) => post("/api/tokens/revoke", { hash }),
     remote: () => get("/api/remote"),
     history: () => get("/api/history"),
     pull: () => post("/api/pull"),
