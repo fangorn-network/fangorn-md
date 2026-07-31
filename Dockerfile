@@ -13,6 +13,7 @@ COPY node_modules ./node_modules
 COPY package.json vite.config.js index.html ./
 COPY src ./src
 COPY server ./server
+COPY mcp ./mcp
 
 # Build the frontend into dist/ (vite lives in the copied node_modules).
 # VITE_* vars are inlined into the bundle at BUILD time, so the Privy app id
