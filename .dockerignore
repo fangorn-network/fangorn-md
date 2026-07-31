@@ -1,8 +1,10 @@
-# node_modules is intentionally NOT ignored — the image copies it (see Dockerfile).
+# node_modules is NOT copied — the image runs `pnpm install --prod`.
+# Keeping it out drops the build context from ~1.4GB to a few MB.
+# dist IS copied — it's built on a dev machine, not in the image.
+node_modules
 .git
 .env
 .fangorn
 docs
-dist
 README.md
 commit.json

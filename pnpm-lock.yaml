@@ -14,9 +14,6 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: ^1.30.0
         version: 1.30.0(zod@4.4.3)
-      '@privy-io/react-auth':
-        specifier: ^3.35.1
-        version: 3.35.2(@solana-program/system@0.10.0(@solana/kit@5.5.1(bufferutil@4.1.0)(utf-8-validate@5.0.10)))(@solana-program/token@0.9.0(@solana/kit@5.5.1(bufferutil@4.1.0)(utf-8-validate@5.0.10)))(@solana/kit@5.5.1(bufferutil@4.1.0)(utf-8-validate@5.0.10))(@solana/sysvars@5.5.1)(@tanstack/query-core@5.101.4)(@tanstack/react-query@5.101.4(react@19.2.8))(@types/react@19.2.17)(bufferutil@4.1.0)(encoding@0.1.13)(react-dom@19.2.8(react@19.2.8))(react-native@0.86.2(@babel/core@7.29.7)(@types/react@19.2.17)(bufferutil@4.1.0)(react@19.2.8)(utf-8-validate@5.0.10))(react@19.2.8)(use-sync-external-store@1.4.0(react@19.2.8))(utf-8-validate@5.0.10)(zod@4.4.3)
       '@slate-yjs/core':
         specifier: ^1.0.2
         version: 1.0.2(slate@0.126.0)(yjs@13.6.31)
@@ -29,24 +26,9 @@ importers:
       katex:
         specifier: ^0.18.1
         version: 0.18.1
-      multiformats:
-        specifier: ^14.0.4
-        version: 14.0.5
-      react:
-        specifier: ^19.2.7
-        version: 19.2.8
-      react-dom:
-        specifier: ^19.2.7
-        version: 19.2.8(react@19.2.8)
       slate:
         specifier: ^0.126.0
         version: 0.126.0
-      slate-history:
-        specifier: ^0.113.1
-        version: 0.113.1(slate@0.126.0)
-      slate-react:
-        specifier: ^0.126.0
-        version: 0.126.0(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(slate-dom@0.126.0(slate@0.126.0))(slate@0.126.0)
       viem:
         specifier: ^2.55.1
         version: 2.55.10(bufferutil@4.1.0)(utf-8-validate@5.0.10)(zod@4.4.3)
@@ -60,12 +42,30 @@ importers:
         specifier: ^13.6.31
         version: 13.6.31
     devDependencies:
+      '@privy-io/react-auth':
+        specifier: ^3.35.1
+        version: 3.35.2(@solana-program/system@0.10.0(@solana/kit@5.5.1(bufferutil@4.1.0)(utf-8-validate@5.0.10)))(@solana-program/token@0.9.0(@solana/kit@5.5.1(bufferutil@4.1.0)(utf-8-validate@5.0.10)))(@solana/kit@5.5.1(bufferutil@4.1.0)(utf-8-validate@5.0.10))(@solana/sysvars@5.5.1)(@tanstack/query-core@5.101.4)(@tanstack/react-query@5.101.4(react@19.2.8))(@types/react@19.2.17)(bufferutil@4.1.0)(encoding@0.1.13)(react-dom@19.2.8(react@19.2.8))(react-native@0.86.2(@babel/core@7.29.7)(@types/react@19.2.17)(bufferutil@4.1.0)(react@19.2.8)(utf-8-validate@5.0.10))(react@19.2.8)(use-sync-external-store@1.4.0(react@19.2.8))(utf-8-validate@5.0.10)(zod@4.4.3)
       '@vitejs/plugin-react':
         specifier: ^6.0.3
         version: 6.0.4(vite@8.1.5(@types/node@26.1.2)(terser@5.49.0)(yaml@2.9.0))
       concurrently:
         specifier: ^10.0.3
         version: 10.0.4
+      multiformats:
+        specifier: ^14.0.4
+        version: 14.0.5
+      react:
+        specifier: ^19.2.7
+        version: 19.2.8
+      react-dom:
+        specifier: ^19.2.7
+        version: 19.2.8(react@19.2.8)
+      slate-history:
+        specifier: ^0.113.1
+        version: 0.113.1(slate@0.126.0)
+      slate-react:
+        specifier: ^0.126.0
+        version: 0.126.0(react-dom@19.2.8(react@19.2.8))(react@19.2.8)(slate-dom@0.126.0(slate@0.126.0))(slate@0.126.0)
       vite:
         specifier: ^8.1.4
         version: 8.1.5(@types/node@26.1.2)(terser@5.49.0)(yaml@2.9.0)

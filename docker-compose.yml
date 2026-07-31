@@ -1,4 +1,8 @@
-# Run: docker compose up --build   (reads secrets from .env)
+# Run: pnpm build && docker compose up --build   (reads secrets from .env)
+#
+# `pnpm build` first: the image ships the prebuilt dist/ rather than running
+# vite itself, so low-memory hosts (Pi) never have to bundle. VITE_PRIVY_APP_ID
+# is inlined into the bundle by that local build, not by docker.
 #
 # The server needs .fangorn/repos.json to exist. On first run either init a repo
 # via the CLI first, or bring the stack up and create one from the UI.
@@ -6,10 +10,6 @@ services:
   fangornmd:
     build:
       context: .
-      args:
-        # Inlined into the browser bundle at build time (public value; the
-        # server also reads it at runtime via env_file). Interpolated from .env.
-        VITE_PRIVY_APP_ID: ${VITE_PRIVY_APP_ID}
     ports:
       - "8787:8787"
     env_file: .env
