@@ -6,6 +6,7 @@ import "katex/dist/katex.min.css";
 import { findMath } from "./mdmath.js";
 import { fenceLines } from "./mdfence.js";
 import { renderMarkdown, renderMath } from "./render.js";
+import { drawMermaid, withMermaid } from "./mermaid.js";
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import { withYjs, withYHistory, YjsEditor } from "@slate-yjs/core";
@@ -241,7 +242,11 @@ const imageFrom = (dataTransfer) =>
 // the caret, so this is where one is finally just a link: a plain click on a
 // note link navigates, external links open in a tab. Same markdown, no caret.
 function DocView({ md, onNavigate, paneRef, onScroll }) {
-    const html = useMemo(() => renderMarkdown(md), [md]);
+    // `drawn` only exists to re-run the memo once a diagram has finished
+    // drawing; withMermaid reads the cache, so the count itself means nothing.
+    const [drawn, setDrawn] = useState(0);
+    const html = useMemo(() => withMermaid(renderMarkdown(md)), [md, drawn]);
+    useEffect(() => { drawMermaid(html, () => setDrawn((n) => n + 1)); }, [html]);
     const handleClick = (e) => {
         const a = e.target.closest?.("a[data-note]");
         if (!a) return;

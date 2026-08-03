@@ -40,6 +40,8 @@ export const api = {
     createRepo: (namespace, visibility) => post("/api/repos", { namespace, visibility }),
     followRepo: (owner, namespace) => post("/api/repos/follow", { owner, namespace }),
     setActiveRepo: (namespace) => post("/api/repos/active", { namespace }),
+    // Rebuild the repo list from the chain — this relay may never have seen you.
+    discoverRepos: () => post("/api/repos/discover"),
     // Owner-only: the addresses allowed to co-edit this namespace's working tree.
     setCollaborators: async (namespace, collaborators) =>
         fetch("/api/collaborators", {
@@ -49,15 +51,23 @@ export const api = {
         }).then(json),
     notes: () => get("/api/notes"),
     note: (path) => get(`/api/notes/${encodeURIComponent(path)}`),
-    save: async (path, content) =>
-        fetch(`/api/notes/${encodeURIComponent(path)}`, {
+    // `ns` names the target namespace instead of leaning on the server's active
+    // pointer. Any write that spans an await the user can interrupt — a wallet
+    // prompt, most of all — must name it, or the switch they make while waiting
+    // redirects the write into whatever namespace is active when it lands.
+    save: async (path, content, ns) =>
+        fetch(`/api/notes/${encodeURIComponent(path)}${ns ? `?ns=${encodeURIComponent(ns)}` : ""}`, {
             method: "PUT",
             headers: await authHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify({ content }),
         }).then(json),
     deleteNote: async (path) =>
         fetch(`/api/notes/${encodeURIComponent(path)}`, { method: "DELETE", headers: await authHeaders() }).then(json),
+    deleteNotes: (paths) => post("/api/notes/delete", { paths }),
     renameNote: (path, to) => post(`/api/notes/${encodeURIComponent(path)}/rename`, { to }),
+    // Local delete: stop tracking, remove the working tree. Published commits
+    // stay on-chain — nothing can unpublish those.
+    deleteRepo: (namespace) => post("/api/repos/delete", { namespace }),
     saveTree: async (tree) =>
         fetch("/api/tree", {
             method: "PUT",
@@ -72,9 +82,12 @@ export const api = {
     revokeToken: (hash) => post("/api/tokens/revoke", { hash }),
     remote: () => get("/api/remote"),
     history: () => get("/api/history"),
-    pull: () => post("/api/pull"),
+    pull: (ns) => post(`/api/pull${ns ? `?ns=${encodeURIComponent(ns)}` : ""}`),
     // Self-custodial publish: server builds the commit (keyless) and returns the
     // unsigned settlement tx; the browser signs+sends it, then reports back.
-    publishPrepare: (message, sealed) => post("/api/publish/prepare", { message, sealed }),
+    // `confirmDrop` acknowledges that this publish removes notes from the
+    // namespace (a publish is a snapshot; see the 409 from prepare).
+    publishPrepare: (message, sealed, confirmDrop) =>
+        post("/api/publish/prepare", { message, sealed, confirmDrop }),
     settle: (namespace, commitCid, txHash) => post("/api/settle", { namespace, commitCid, txHash }),
 };

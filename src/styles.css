@@ -117,6 +117,7 @@ body {
     color: var(--text-dim);
     line-height: 1.6;
 }
+.sidebar-head-actions { display: flex; align-items: center; gap: 4px; }
 
 /* ── Repo switcher ───────────────────────────────────── */
 .repo-bar { border-bottom: 1px solid var(--border); padding: 8px 6px; }
@@ -134,22 +135,29 @@ body {
 }
 .repo-bar-actions { display: flex; gap: 2px; }
 .repo-switch { display: flex; flex-direction: column; gap: 2px; }
+.repo-row { display: flex; align-items: center; border-radius: 6px; padding-right: 4px; }
+.repo-row:hover { background: var(--bg-hover); }
+.repo-row.active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); font-weight: 600; }
+/* Dim rather than hover-hidden: a phone has no hover, and "no visible delete"
+   is exactly the bug this row is fixing. */
+.repo-row .tree-act { opacity: 0.4; }
+.repo-row:hover .tree-act, .repo-row .tree-act:focus-visible { opacity: 1; }
 .repo-item {
     display: flex;
     align-items: center;
     gap: 6px;
-    width: 100%;
+    flex: 1;
+    min-width: 0;
     text-align: left;
     padding: 6px 10px;
     border: 0;
     border-radius: 6px;
     background: none;
-    color: var(--text);
+    color: inherit;
+    font: inherit;
     cursor: pointer;
     font-size: 13px;
 }
-.repo-item:hover { background: var(--bg-hover); }
-.repo-item.active { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); font-weight: 600; }
 .repo-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .repo-badge { font-size: 11px; }
 .repo-dot {
@@ -437,6 +445,32 @@ body {
 .doc-render pre code { background: none; padding: 0; font-size: 0.85em; }
 .doc-render hr { border: 0; border-top: 1px solid var(--border); margin: 2em 0; }
 .doc-render img { max-width: 100%; border-radius: 6px; }
+
+/* Tables scroll on their own rather than widening the pane — a split view is
+   narrow, and a wide table shouldn't push the prose off-screen. */
+.doc-render table {
+    display: block;
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+    margin: 0 0 1em;
+    font-size: 0.95em;
+}
+.doc-render th, .doc-render td { border: 1px solid var(--border); padding: 0.4em 0.75em; text-align: left; }
+.doc-render thead th { background: var(--bg-panel); font-weight: 600; }
+.doc-render tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg-panel) 45%, transparent); }
+
+/* Checkbox lists lose their bullet: the box is the marker. */
+.doc-render .task { display: inline-flex; gap: 0.5em; align-items: baseline; }
+.doc-render li:has(.task) { list-style: none; margin-left: -1.2em; }
+.doc-render .task input { accent-color: var(--accent); }
+
+/* A mermaid block is source text until the SVG lands, so it keeps the code
+   background until then and drops it once there's a diagram to show. */
+.doc-render pre.mermaid { text-align: center; }
+.doc-render pre.mermaid:has(svg) { background: none; border: 0; padding: 0; }
+.doc-render pre.mermaid svg { max-width: 100%; height: auto; }
 .doc-render .katex-display { margin: 0.8em 0; }
 
 /* KaTeX ships its own error colour; keep it legible on the dark panel. */
@@ -454,6 +488,74 @@ body {
 }
 
 .empty { flex: 1; display: grid; place-items: center; color: var(--text-dim); }
+
+/* ── Files view ──────────────────────────────────────── */
+.files { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.files-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-panel);
+}
+.files-search {
+    flex: 1;
+    max-width: 340px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-input);
+    color: var(--text);
+    font-size: 13px;
+}
+.files-count { flex: 1; font-size: 12px; color: var(--text-dim); }
+.files-table { flex: 1; overflow-y: auto; padding: 8px 0; }
+/* One grid per row rather than a <table>: the title has to be a button (it
+   opens the note) while the row itself is the selection hit target. */
+.files-row {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) minmax(0, 16em) 8em;
+    align-items: center;
+    padding: 2px 16px 2px 0;
+    cursor: default;
+    border-left: 2px solid transparent;
+}
+.files-row:hover { background: var(--bg-hover); }
+.files-row.picked { background: var(--accent-soft); }
+.files-row.active { border-left-color: var(--accent); }
+.files-check { justify-self: center; width: 16px; height: 16px; accent-color: var(--accent); pointer-events: none; }
+.files-title {
+    border: 0;
+    background: none;
+    color: var(--text);
+    font: inherit;
+    font-size: 14px;
+    text-align: left;
+    padding: 7px 8px 7px 0;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.files-title:hover { color: var(--accent); text-decoration: underline; }
+.files-path, .files-when {
+    font-size: 12px;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.files-when { text-align: right; }
+.files-empty { padding: 24px 16px; color: var(--text-dim); text-align: center; }
+
+@media (max-width: 720px) {
+    /* No room for three columns on a phone — title and checkbox carry it. */
+    .files-row { grid-template-columns: 34px minmax(0, 1fr) 6.5em; }
+    .files-path { display: none; }
+    .files-search { max-width: none; }
+    .files-count { flex: 0 0 auto; }
+}
 
 /* ── Buttons ─────────────────────────────────────────── */
 .btn {
@@ -475,6 +577,9 @@ body {
 .btn.ghost { border: 0; background: none; color: var(--text-dim); }
 .btn.ghost:hover { background: var(--bg-hover); color: var(--text); }
 .btn.small { padding: 2px 9px; }
+.btn.danger { color: var(--danger); }
+.btn.danger:hover { border-color: var(--danger); background: var(--danger); color: #fff; }
+.btn.danger:disabled { opacity: 0.45; cursor: default; }
 /* Share reads as the second action after Publish, not as chrome. */
 .btn.share { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); font-weight: 600; }
 .btn.share:hover { background: var(--accent); color: var(--accent-text); }

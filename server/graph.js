@@ -2,8 +2,10 @@ import { buildAssetGraph } from "@fangorn-network/sdk";
 
 // ─── Files → graph ────────────────────────────────────────────────────────────
 //
-// Every publish stages the FULL graph, not a delta. Two properties of Fangorn
-// make that the right call:
+// Every publish stages the FULL graph, not a delta, and settles it as a
+// SNAPSHOT (`replace: true` in the prepare route) — so a file that isn't here
+// isn't in the wiki, which is the only way deleting a note can stick. Two
+// properties of Fangorn make staging everything the right call:
 //
 //   1. Vertices are content-addressed: an unchanged payload produces the exact
 //      same CID and pail key, so re-staging it is a free no-op. Only notes
@@ -13,7 +15,8 @@ import { buildAssetGraph } from "@fangorn-network/sdk";
 //      note to be staged too.
 //
 // The store is append-only — editing a note ADDS a new version rather than
-// replacing the old one. That means the payload itself must carry:
+// replacing the old one, and the snapshot only changes which versions the
+// namespace still points at, not what exists. So the payload itself must carry:
 //   - identity  (`path`):      which note is this a version of?
 //   - ordering  (`updatedAt`): which version is newest?
 //

@@ -260,6 +260,9 @@ mutable state between users.
 | `PUT /api/tree` | Persist the drag-and-drop hierarchy |
 | `GET /api/remote` | Latest published version of every note, plus edges |
 | `POST /api/pull` | Materialize published versions into the working tree |
+| `POST /api/repos/discover` | Rebuild the repo list from the chain (§12) |
+| `POST /api/repos/delete` | Stop tracking a namespace, delete its tree — **browser only** (§12) |
+| `POST /api/notes/delete` | Delete many notes in one call (multi-select) |
 | `POST /api/publish/prepare` | Build + pin the commit, return an **unsigned** tx — **browser only** |
 | `POST /api/settle` | Record the head after the browser's tx confirms — **browser only** |
 | `GET /api/history` | Walk commits from the current head |
@@ -268,7 +271,10 @@ mutable state between users.
 
 Which repo a request acts on comes from `repoFor()`: a pinned token gets its
 namespace and nothing else, anyone else gets `?ns=` if they sent one and the
-active repo otherwise. One helper, so the rule holds on every note route by
+active repo otherwise. **The browser sends `?ns=` for any write that spans an
+await the user can interrupt** — a wallet prompt above all. Falling back to the
+active pointer means the space they switch to while waiting receives the write:
+one namespace's notes land in another's tree. One helper, so the rule holds on every note route by
 construction rather than by remembering.
 
 **Collaborators work in the owner's directory** — same files, same
@@ -392,18 +398,54 @@ than letting it fail in the wallet.
 Only the owner's wallet can settle. Collaborators can write and co-edit the
 working tree; publishing is the owner's act.
 
+**A publish is a snapshot** (`replace: true`), and that is what makes deleting
+mean anything: staging only the files that exist would leave a deleted note's
+last version in the namespace, and the next pull writes it straight back. The
+same property in reverse is the hazard — a working tree missing notes it never
+had would drop them — so `prepare` computes the drop set (published paths with
+no local file), refuses with a 409 naming them, and the browser asks before
+retrying with `confirmDrop`. The state that makes this real rather than
+theoretical: a *discovered* private namespace, whose sealed bodies the relay
+cannot materialize into files (§12). Dropped versions stay in history —
+`fangorn.log()` still walks to them.
+
 ## 9. Private namespaces
 
 A private repo's notes are sealed in the browser
 ([src/crypto.js](src/crypto.js)) with a key derived from a deterministic wallet
 signature — Privy never exposes the raw private key, so the secret is derived,
-not stored. At publish, `content` is swapped for `enc` before the commit; the
-server pins ciphertext it cannot read.
+not stored. The signed message names the namespace, so one wiki's key opens that
+wiki and nothing else. At publish, `content` is swapped for `enc` before the
+commit; the server pins ciphertext it cannot read.
+
+That key can be handed to an agent: tick *"also hand over the decryption key"*
+when minting an agent token and it is derived in the tab, shown once, and never
+sent to the server — which is what keeps the relay unable to read what it pins.
+It decrypts and nothing else (it cannot spend, publish, or sign), but unlike a
+token it **cannot be revoked**: re-keying means re-sealing every note.
 
 `path` and `updatedAt` stay clear because they carry identity and ordering, so
 **filenames leak and bodies don't**. Server-side, any encrypted payload is
 replaced with a placeholder before it can reach a response — the server can't
 decrypt, and won't pretend to.
+
+**Reading one back.** The working tree is plaintext (that's what the editor,
+the renderer and the live rooms all read), and sealing happens on the way out.
+So a private space published from another instance arrives here as ciphertext
+the relay cannot write to disk — an empty sidebar, notes that look lost. `pull`
+therefore returns those payloads *sealed*, the browser opens them with the
+wallet key and saves the plaintext working copy (`restoreSealed` in
+[src/App.jsx](src/App.jsx)). It runs automatically only when a private space
+has an on-chain head and no local files — the one case with nothing to lose —
+and otherwise waits for an explicit Pull, because writing published content
+over a working tree is how you eat unpublished edits. Only notes with no local
+file are ever handed back sealed.
+
+Keys are tried newest-first: `v2:<namespace>`, then the original global `v1`
+message. Anything a v1 key opens is re-sealed under v2 by the next publish, so
+the migration is just "publish once". A note neither key opens was sealed by a
+different wallet; it's reported by name and left alone, never stubbed — a
+placeholder saved into the tree would be published over the real note.
 
 ## 10. Public read (and agents)
 
@@ -467,6 +509,15 @@ two transports:
 | **HTTP** | `POST /mcp` on this server | Everyone. Nothing to install — an agent needs a URL and a token, not a checkout, Node, or a copy of this repo. |
 | stdio | [mcp/fangornmd.js](mcp/fangornmd.js) | Hacking on a checkout. |
 
+`write_note` takes an optional **`parent`** — the filename of an existing note to
+nest the new one under — so an agent can build structure instead of dropping
+everything at the root (`reconcileTree` files an unfiled note as a root, and
+before this an agent had no way to move it). It is a *parent*, not a directory:
+one namespace is one Fangorn subspace, notes are flat on disk, and a vertex's
+identity is its filename, so `research/notes.md` is not a path this accepts.
+Nesting lands in `.tree.json`, which is what the sidebar renders and what
+publish turns into the graph's edges — so an agent's hierarchy publishes.
+
 Hosting the MCP server separately would be a second deployment to run, secure
 and keep in version step with an API it is a strict subset of. It's a route
 instead, so every user of an instance gets exactly what that instance is
@@ -513,6 +564,30 @@ link carrying both; opening it offers to subscribe, pull, and open the note.
 Following is read-only and needs no permission from anyone — reading and
 subscribing are unpermissioned by construction.
 
+**Sync (↻)** recovers the list itself. Which repos you track is per-relay state
+(a JSON file under `DATA_DIR`); the namespaces are on-chain. So the same wallet
+on a second instance — a local dev server, a fresh volume — logs in to an empty
+sidebar with its wikis sitting right there on-chain. `POST /api/repos/discover`
+asks the registry: one `getLogs` filtered to `(app, publisher)` returns every
+subspace this address has committed under, and since the event carries only
+`keccak256(name)`, the name comes from each commit's own root map
+(`engine.namespaceOf`). Each recovered namespace is then pulled into a working
+tree, and `visibility` comes from whether its payloads carry `enc` — guessing
+"public" there would publish a private wiki in the clear on its next publish.
+
+**Deleting.** ☑ in the sidebar header turns the tree into a picker: tap rows to
+select (no hover, no long-press — the same gesture on a phone and a laptop),
+then Delete once for the whole set. One request, one tree rewrite, so the
+sidebar can't render a half-finished selection. Rows aren't draggable while
+picking; a drag and a tap on the same element can't both win.
+
+Deleting notes is local until you publish — the snapshot in §8 is what removes
+them from the wiki. Deleting a *namespace* ("Delete this space") is local,
+full stop: it forgets the repo and removes the working tree, and the on-chain
+head keeps pointing where it pointed. The relay records it as `forgotten`, or
+the next Sync would helpfully hand it straight back. Following someone else's
+namespace resolves your `dir` to *their* tree, so leaving one deletes nothing.
+
 Live sync: the browser holds one `EventSource` on `/api/events`. Remote changes
 come off a single app-wide subscription (fangornmd owns the app prefix, so one
 topic filter covers every wiki on the instance) and each connection picks out
@@ -549,9 +624,12 @@ Roughly in the order they're worth fixing:
   which characters; nothing renders it. An agent whose edits arrive visibly
   marked and provisional is a different tool than one that silently rewrites
   your paragraph, and the data to do it is already in the room.
-- **No deletes on-chain.** Removing a file drops it from future edges, but its
-  latest version still wins the `latestByPath` reduce, so a pull can resurrect
-  it. The fix is a tombstone version respected by the reduce.
+- **Deleting is per-namespace, not global.** A publish replaces the namespace's
+  contents (§8), so a deleted note leaves the wiki — but its blocks are
+  content-addressed and still in storage, still referenced by the commit that
+  staged them. Anyone holding the CID keeps reading it. That's the model, not a
+  bug: history is the point. What's missing is the loud version of it — the app
+  says "removed from the wiki", never "unpublished".
 - **Private notes re-seal every publish.** A fresh nonce means a new CID even
   for unchanged content, so the identical-payload saving from §1 never applies —
   the server can't decrypt remote state to detect what actually changed.

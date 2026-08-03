@@ -102,6 +102,17 @@ const isRule = (line) => /^\s*([-*_])(\s*\1){2,}\s*$/.test(line);
 // Lines that start a block of their own, so a paragraph must stop before them.
 const BLOCK = /^(#{1,6}\s|>|\s*(?:[-*+]|\d+\.)\s)/;
 
+// ── GFM pipe tables ───────────────────────────────────────────────
+// The row under the header, which is what makes a line full of pipes a table
+// rather than a sentence about plumbing: `---`, `:--`, `--:` or `:-:` per column.
+const DELIM = /^\s*\|?(\s*:?-+:?\s*\|)*\s*:?-+:?\s*\|?\s*$/;
+// Outer pipes are optional; an escaped \| is a literal pipe inside a cell.
+const splitRow = (line) =>
+    line.trim().replace(/^\|/, "").replace(/\|$/, "")
+        .split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
+const alignOf = (c) =>
+    c.endsWith(":") ? (c.startsWith(":") ? "center" : "right") : c.startsWith(":") ? "left" : "";
+
 /**
  * Render a whole note. Blocks are line-based, matching the editor's
  * one-paragraph-per-line value: consecutive plain lines become one paragraph
@@ -116,6 +127,29 @@ export function renderMarkdown(md) {
         while (lists.length && lists[lists.length - 1].indent > toIndent) out.push(`</li></${lists.pop().tag}>`);
     };
 
+    // A table if the line has a pipe and the next line is a delimiter row that
+    // agrees on column count — the count check is what keeps "a | b" over "---"
+    // from turning a paragraph and a rule into a one-row table. Returns the
+    // block and the line after it, or null when this isn't one.
+    const tableAt = (start) => {
+        if (!lines[start].includes("|") || fence[start] || !DELIM.test(lines[start + 1] ?? "")) return null;
+        const head = splitRow(lines[start]);
+        const align = splitRow(lines[start + 1]).map(alignOf);
+        if (align.length !== head.length) return null;
+        const cell = (text, col, tag) =>
+            `<${tag}${align[col] ? ` style="text-align:${align[col]}"` : ""}>${inline(text)}</${tag}>`;
+        const row = (cells, tag) => `<tr>${head.map((_, c) => cell(cells[c] ?? "", c, tag)).join("")}</tr>`;
+        let end = start + 2;
+        const body = [];
+        // Short rows are padded and long ones truncated, both by head.map above:
+        // a ragged table still renders as a rectangle instead of vanishing.
+        while (end < lines.length && lines[end].includes("|") && !fence[end]) body.push(splitRow(lines[end++]));
+        return {
+            html: `<table><thead>${row(head, "th")}</thead><tbody>${body.map((r) => row(r, "td")).join("")}</tbody></table>`,
+            next: end,
+        };
+    };
+
     let i = 0;
     while (i < lines.length) {
         const line = lines[i];
@@ -128,13 +162,24 @@ export function renderMarkdown(md) {
             while (i < lines.length && fence[i] === "body") body.push(lines[i++]);
             if (fence[i] === "close") i++;
             closeLists();
-            out.push(`<pre${lang ? ` data-lang="${esc(lang)}"` : ""}><code>${esc(body.join("\n"))}</code></pre>`);
+            // A mermaid fence stays source in the output — the diagram is drawn
+            // later, from this element's text, by whoever is displaying it
+            // (mermaid.js in the app pane, the CDN script on an exported page).
+            // Keeping it in the HTML means one renderer still covers both, and a
+            // reader with no JavaScript sees the diagram's source rather than a
+            // blank space.
+            out.push(lang === "mermaid"
+                ? `<pre class="mermaid">${esc(body.join("\n"))}</pre>`
+                : `<pre${lang ? ` data-lang="${esc(lang)}"` : ""}><code>${esc(body.join("\n"))}</code></pre>`);
             continue;
         }
 
         if (!line.trim()) { closeLists(); i++; continue; } // blank line ends any block
 
         if (isRule(line)) { closeLists(); out.push("<hr>"); i++; continue; }
+
+        const table = tableAt(i);
+        if (table) { closeLists(); out.push(table.html); i = table.next; continue; }
 
         // List item. Leading spaces nest, so `lists` is a stack keyed by indent.
         const li = line.match(/^(\s*)(?:[-*+]|(\d+)\.)\s+(.*)$/);
@@ -146,7 +191,12 @@ export function renderMarkdown(md) {
             if (top && top.indent === indent && top.tag !== tag) { out.push(`</li></${lists.pop().tag}>`); }
             if (lists.length && lists[lists.length - 1].indent === indent) out.push("</li><li>");
             else { out.push(`<${tag}><li>`); lists.push({ tag, indent }); }
-            out.push(inline(li[3]));
+            // `- [ ]` / `- [x]`: a checkbox you can see but not click. The note
+            // is the source of truth, so ticking one means editing the markdown.
+            const task = li[3].match(/^\[([ xX])\]\s+(.*)$/);
+            out.push(task
+                ? `<label class="task"><input type="checkbox" disabled${task[1] === " " ? "" : " checked"}> ${inline(task[2])}</label>`
+                : inline(li[3]));
             i++;
             continue;
         }
@@ -164,7 +214,8 @@ export function renderMarkdown(md) {
         }
 
         const para = [];
-        while (i < lines.length && lines[i].trim() && !fence[i] && !BLOCK.test(lines[i]) && !isRule(lines[i])) {
+        while (i < lines.length && lines[i].trim() && !fence[i] && !BLOCK.test(lines[i])
+            && !isRule(lines[i]) && !tableAt(i)) {
             para.push(lines[i++]);
         }
         out.push(`<p>${para.map(inline).join("<br>")}</p>`);
@@ -178,6 +229,15 @@ export function renderMarkdown(md) {
 // case) stays genuinely self-contained; one with math links the stylesheet and
 // needs the network the first time it's opened.
 const KATEX_CSS = "https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.css";
+
+// Same bargain for mermaid, and only for a note that actually draws one: the
+// diagram is source in the HTML until this script turns it into an SVG, so a
+// reader offline (or with scripts off) still gets the readable text of it.
+export const MERMAID_URL = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+const MERMAID_JS = `<script type="module">
+import mermaid from "${MERMAID_URL}";
+mermaid.initialize({ startOnLoad: true, securityLevel: "strict", theme: "neutral" });
+</script>`;
 
 // Deliberately light and plain: an export is read outside the app, printed, or
 // mailed on, and it should look like a document rather than like this editor.
@@ -209,6 +269,14 @@ body { margin: 0; background: #fff; color: #1a1d21; }
 .doc-render pre code { background: none; padding: 0; font-size: 0.85em; }
 .doc-render hr { border: 0; border-top: 1px solid #e0e4ea; margin: 2em 0; }
 .doc-render img { max-width: 100%; border-radius: 6px; }
+.doc-render .task { display: inline-flex; gap: 0.5em; align-items: baseline; }
+.doc-render li:has(.task) { list-style: none; margin-left: -1.2em; }
+.doc-render table { border-collapse: collapse; margin: 0 0 1em; font-size: 0.95em; display: block; overflow-x: auto; }
+.doc-render th, .doc-render td { border: 1px solid #e0e4ea; padding: 0.4em 0.75em; text-align: left; }
+.doc-render thead th { background: #f6f8fa; font-weight: 600; }
+.doc-render tbody tr:nth-child(even) { background: #fafbfc; }
+.doc-render pre.mermaid { background: none; border: 0; padding: 0; text-align: center; font: 0.85em ui-monospace, monospace; }
+.doc-render pre.mermaid svg { max-width: 100%; height: auto; }
 @media print {
     .doc-render { max-width: none; padding: 0; font-size: 12pt; }
     .doc-render a { color: inherit; text-decoration: underline; }
@@ -227,7 +295,7 @@ export function exportHtml(md, title, extra = "") {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
 ${body.includes("katex") ? `<link rel="stylesheet" href="${KATEX_CSS}">\n` : ""}<style>${EXPORT_CSS}</style>
-</head><body><article class="doc-render">${body}${extra}</article></body></html>`;
+</head><body><article class="doc-render">${body}${extra}</article>${body.includes(`class="mermaid"`) ? MERMAID_JS : ""}</body></html>`;
 }
 
 const FOOT_CSS = "margin-top:3em;padding-top:1em;border-top:1px solid #e0e4ea;font-size:0.82em;color:#6b7280";

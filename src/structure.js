@@ -12,6 +12,27 @@ export function buildBacklinks(notes) {
     return backlinks;
 }
 
+/**
+ * Depth-first walk of the tree into the row order the Files view renders.
+ * Returns [{ path, depth }] — indentation without giving up a flat list, which
+ * is what range-selection and "select all" need.
+ */
+export function flattenTree(tree, depth = 0) {
+    return tree.flatMap((n) => [{ path: n.path, depth }, ...flattenTree(n.children, depth + 1)]);
+}
+
+/**
+ * The paths between two rows, inclusive, in whatever order they're displayed —
+ * shift-click. Either endpoint missing (a filtered-away anchor) yields just the
+ * ones that are present.
+ */
+export function pathsBetween(rows, a, b) {
+    const i = rows.findIndex((r) => r.path === a);
+    const j = rows.findIndex((r) => r.path === b);
+    if (i < 0 || j < 0) return [b, a].filter((p) => rows.some((r) => r.path === p));
+    return rows.slice(Math.min(i, j), Math.max(i, j) + 1).map((r) => r.path);
+}
+
 // ── Drag-and-drop tree edits (pure) ───────────────────────────────────────────
 // Nodes are { path, children: [...] }. Drops are "before" | "after" | "inside".
 

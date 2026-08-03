@@ -35,6 +35,43 @@ test("provenance is on the page", () => {
     assert.match(html, /<h1>Karaage<\/h1>/);
 });
 
+test("pipe tables: alignment, inline markdown, ragged rows", () => {
+    const html = renderMarkdown([
+        "| a | b | c |",
+        "|:--|:-:|--:|",
+        "| 1 | **two** | 3 |",
+        "| only one",
+    ].join("\n"));
+    assert.match(html, /<thead><tr><th style="text-align:left">a<\/th>/);
+    assert.match(html, /<th style="text-align:center">b<\/th><th style="text-align:right">c<\/th>/);
+    assert.match(html, /<td style="text-align:center"><strong>two<\/strong><\/td>/);
+    // A short row is padded to the header's width instead of dropping the table.
+    assert.match(html, /<tr><td style="text-align:left">only one<\/td><td[^>]*><\/td><td[^>]*><\/td><\/tr>/);
+});
+
+test("a paragraph over a rule is not a one-row table", () => {
+    // Same shape as a table (a line with a pipe, then dashes) but the column
+    // counts disagree, so it stays prose plus an <hr>.
+    const html = renderMarkdown("cats | dogs\n---");
+    assert.match(html, /<p>cats \| dogs<\/p><hr>/);
+    assert.ok(!html.includes("<table>"), "no table");
+});
+
+test("mermaid fences stay source in the HTML and bring their own script", () => {
+    const html = renderMarkdown("```mermaid\ngraph TD; A-->B;\n```");
+    assert.equal(html, `<pre class="mermaid">graph TD; A--&gt;B;</pre>`);
+    // Only a note with a diagram pays for the library.
+    assert.match(publicPage("```mermaid\ngraph TD; A-->B;\n```", meta), /mermaid\.esm\.min\.mjs/);
+    assert.ok(!publicPage("plain note", meta).includes("<script"), "no diagram, no script");
+});
+
+test("task list items render as checkboxes", () => {
+    const html = renderMarkdown("- [ ] todo\n- [x] done\n- plain");
+    assert.match(html, /<input type="checkbox" disabled> todo/);
+    assert.match(html, /<input type="checkbox" disabled checked> done/);
+    assert.match(html, /<li>plain<\/li>/);
+});
+
 test("a hostile note can't write markup into the page it's served from", () => {
     const html = publicPage("<script>alert(1)</script>\n\n[x](javascript:alert(1))", {
         ...meta, title: "</title><script>alert(1)</script>",

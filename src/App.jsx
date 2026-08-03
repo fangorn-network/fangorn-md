@@ -1,13 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePrivy, useWallets, useSignMessage } from "@privy-io/react-auth";
 import { api, setTokenGetter, setAddress } from "./api.js";
-import { deriveSecret, sealContent } from "./crypto.js";
+import { deriveSecret, deriveSecretHex, sealContent, readSecrets, unsealAny } from "./crypto.js";
 import { useEvents } from "./useEvents.js";
-import { buildBacklinks, moveInTree } from "./structure.js";
+import { buildBacklinks, flattenTree, moveInTree, pathsBetween } from "./structure.js";
 import Editor, { CollabEditor } from "./Editor.jsx";
 import { exportHtml } from "./render.js";
 
 const short = (s) => (s ? `${s.slice(0, 8)}…${s.slice(-6)}` : "");
+
+// ponytail: Intl.RelativeTimeFormat, no date library. Coarse on purpose — the
+// Files column answers "did I touch this recently", not "when exactly".
+const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+const UNITS = [["year", 31536e6], ["month", 2592e6], ["day", 864e5], ["hour", 36e5], ["minute", 6e4]];
+function ago(ms) {
+    const delta = ms - Date.now();
+    const [unit, size] = UNITS.find(([, s]) => Math.abs(delta) >= s) ?? ["second", 1000];
+    return rtf.format(Math.round(delta / size), unit);
+}
 
 // How long after our own save to treat an incoming "local-change" as our echo.
 // The server's watcher debounces 200ms before emitting, so this only has to
@@ -178,10 +188,120 @@ function TreeRow({ node, depth, notes, active, writable, onOpen, onMove, onRenam
     );
 }
 
+// The Files view: every note in the namespace as one table, in tree order.
+// It exists because the 240px sidebar can't be a file manager and a navigation
+// rail at once — bulk selection, paths and dates need the width of the main
+// pane, and the sidebar goes back to being a list you click.
+function FilesView({ notes, tree, active, writable, onOpen, onRename, onDelete, onClose }) {
+    const [selection, setSelection] = useState(() => new Set());
+    const [query, setQuery] = useState("");
+    const anchor = useRef(null); // last row clicked, for shift-click ranges
+
+    const byPath = useMemo(() => new Map(notes.map((n) => [n.path, n])), [notes]);
+    const rows = useMemo(() => {
+        const q = query.trim().toLowerCase();
+        return flattenTree(tree)
+            .map((r) => ({ ...r, note: byPath.get(r.path) }))
+            .filter((r) => r.note)
+            .filter((r) => !q || r.path.toLowerCase().includes(q) || r.note.title.toLowerCase().includes(q));
+    }, [tree, byPath, query]);
+
+    // Selecting a note that's since been deleted (or filtered out of the tree)
+    // would send a dead path to the bulk delete, so the set is derived, never
+    // trusted: everything below reads `picked`, not `selection`.
+    const picked = useMemo(
+        () => new Set([...selection].filter((p) => byPath.has(p))),
+        [selection, byPath],
+    );
+
+    const click = (path, e) => {
+        const next = new Set(picked);
+        if (e.shiftKey && anchor.current) {
+            for (const p of pathsBetween(rows, anchor.current, path)) next.add(p);
+        } else {
+            next.has(path) ? next.delete(path) : next.add(path);
+            anchor.current = path;
+        }
+        setSelection(next);
+    };
+
+    const allShown = rows.length > 0 && rows.every((r) => picked.has(r.path));
+    const chosen = [...picked];
+
+    return (
+        <div className="files">
+            <div className="files-bar">
+                <input
+                    className="files-search"
+                    type="search"
+                    placeholder="Filter by title or filename…"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    autoFocus
+                />
+                <button
+                    className="btn ghost small"
+                    onClick={() => setSelection(allShown ? new Set() : new Set(rows.map((r) => r.path)))}
+                    disabled={rows.length === 0}
+                >
+                    {allShown ? "none" : "all"}
+                </button>
+                <span className="files-count">
+                    {picked.size > 0 ? `${picked.size} selected` : `${rows.length} note${rows.length === 1 ? "" : "s"}`}
+                </span>
+                {writable && picked.size === 1 && (
+                    <button className="btn small" onClick={() => onRename(chosen[0])}>Rename</button>
+                )}
+                {writable && (
+                    <button className="btn small danger" disabled={picked.size === 0} onClick={() => onDelete(chosen)}>
+                        Delete
+                    </button>
+                )}
+                <button className="btn ghost small" onClick={onClose} title="Back to the editor">✕</button>
+            </div>
+            <div className="files-table" role="grid">
+                {rows.map(({ path, depth, note }) => (
+                    <div
+                        key={path}
+                        role="row"
+                        className={`files-row${picked.has(path) ? " picked" : ""}${path === active ? " active" : ""}`}
+                        onClick={(e) => click(path, e)}
+                    >
+                        <input
+                            type="checkbox"
+                            className="files-check"
+                            checked={picked.has(path)}
+                            onChange={() => {}}  // the row owns the click, so this is state, not a hit target
+                            tabIndex={-1}
+                            aria-label={`Select ${note.title}`}
+                        />
+                        <button
+                            className="files-title"
+                            style={{ paddingLeft: `${depth * 18}px` }}
+                            // Opening is the one action that must not be swallowed
+                            // by the row's select handler.
+                            onClick={(e) => { e.stopPropagation(); onOpen(path); }}
+                            title={`Open ${path}`}
+                        >
+                            <span className="tree-glyph">{depth > 0 ? "└ " : ""}</span>
+                            {note.title}
+                        </button>
+                        <span className="files-path">{path}</span>
+                        <span className="files-when">{note.updatedAt ? ago(note.updatedAt) : ""}</span>
+                    </div>
+                ))}
+                {rows.length === 0 && (
+                    <div className="files-empty">{query ? "nothing matches that filter" : "no notes yet"}</div>
+                )}
+            </div>
+        </div>
+    );
+}
+
 // The repo switcher: every tracked Fangorn namespace, plus inline forms to
 // create one on your own root (public or private/encrypted) or follow someone
 // else's read-only. A dot marks repos with an unseen on-chain update.
-function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow }) {
+function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow, onDiscover, onDelete }) {
     const [form, setForm] = useState(null); // "new" | "follow" | null
     const [name, setName] = useState("");
     const [visibility, setVisibility] = useState("public");
@@ -207,21 +327,40 @@ function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow }) {
                 <span className="repo-bar-actions">
                     <button className="btn ghost small" title="New — create a space for your notes" onClick={() => setForm(form === "new" ? null : "new")}>＋</button>
                     <button className="btn ghost small" title="Subscribe to someone else's space" onClick={() => setForm(form === "follow" ? null : "follow")}>⌕</button>
+                    <button className="btn ghost small" title="Sync — find spaces this wallet published on-chain" onClick={onDiscover}>↻</button>
                 </span>
             </div>
             <div className="repo-switch">
                 {repos.map((r) => (
-                    <button
-                        key={r.namespace}
-                        className={`repo-item ${r.namespace === active ? "active" : ""}`}
-                        onClick={() => onSwitch(r.namespace)}
-                        title={`${r.namespace} · owner ${r.owner}`}
-                    >
-                        <span className="repo-name">{r.namespace}</span>
-                        {nudges[r.namespace] && r.namespace !== active && <span className="repo-dot" title="on-chain update" />}
-                        {r.visibility === "private" && <span className="repo-badge" title="private (encrypted)">🔒</span>}
-                        {!r.writable && <span className="repo-badge" title="read-only subscription">👁</span>}
-                    </button>
+                    // A row, not a button: the delete has to sit inside it and a
+                    // button can't nest. Deleting from here — rather than only
+                    // from the active space's footer — is the difference between
+                    // "delete this" and "switch to it, scroll past every note,
+                    // then delete it", which read as no delete at all.
+                    <div key={r.namespace} className={`repo-row ${r.namespace === active ? "active" : ""}`}>
+                        <button
+                            className="repo-item"
+                            onClick={() => onSwitch(r.namespace)}
+                            title={`${r.namespace} · owner ${r.owner}`}
+                        >
+                            <span className="repo-name">{r.namespace}</span>
+                            {nudges[r.namespace] && r.namespace !== active && <span className="repo-dot" title="on-chain update" />}
+                            {r.visibility === "private" && <span className="repo-badge" title="private (encrypted)">🔒</span>}
+                            {!r.writable && <span className="repo-badge" title="read-only subscription">👁</span>}
+                            {/* Whether anything was ever settled decides what a
+                                delete actually costs, so it's on the row. */}
+                            <span className="repo-badge" title={r.head ? `published on-chain (head ${short(r.head)}) — deleting is local only` : "never published — local only, deleting is permanent"}>
+                                {r.head ? "⛓" : "◦"}
+                            </span>
+                        </button>
+                        <button
+                            className="tree-act"
+                            title={r.writable ? `Delete ${r.namespace}` : `Stop following ${r.namespace}`}
+                            onClick={() => onDelete(r)}
+                        >
+                            ✕
+                        </button>
+                    </div>
                 ))}
             </div>
             {form === "new" && (
@@ -281,10 +420,11 @@ function CollaboratorPanel({ repo, onSave, onClose }) {
 // The default reaches every wiki you have, so connecting an agent is something
 // you do once rather than once per namespace. Pinning is offered for the token
 // you hand to somebody else's agent, where one wiki is the whole point.
-function AgentPanel({ repo, onClose }) {
+function AgentPanel({ repo, onClose, signForKey }) {
     const [tokens, setTokens] = useState([]);
     const [name, setName] = useState("");
     const [pinned, setPinned] = useState(false);
+    const [shareKey, setShareKey] = useState(false);
     const [minted, setMinted] = useState(null); // shown once — only the hash is stored
     const [err, setErr] = useState(null);
     // In production the server serves this page, so its own origin is the MCP
@@ -300,7 +440,13 @@ function AgentPanel({ repo, onClose }) {
     const mint = async (e) => {
         e.preventDefault();
         try {
-            setMinted(await api.mintToken(pinned ? repo.namespace : null, name || "agent"));
+            const token = await api.mintToken(pinned ? repo.namespace : null, name || "agent");
+            // Derived HERE and never sent anywhere. If the server ever saw this
+            // value it could decrypt everything published from this namespace,
+            // and sealing on publish would stop meaning anything — so it is
+            // computed in the tab, shown once, and kept out of every request.
+            const secret = shareKey ? await deriveSecretHex(signForKey, repo.namespace) : null;
+            setMinted({ ...token, secret });
             setName("");
             load();
         } catch (e2) { setErr(e2.message); }
@@ -320,6 +466,17 @@ function AgentPanel({ repo, onClose }) {
                 <input type="checkbox" checked={pinned} onChange={(e) => setPinned(e.target.checked)} />
                 {" "}Limit this token to <b>{repo.namespace}</b> — for an agent that isn't yours
             </label>
+            {/* Only private wikis have anything sealed to hand a key for. The
+                warning is not decoration: a token is a row in a file and dies
+                when you revoke it, but a key that has left this tab has read
+                every version ever published and cannot be called back. */}
+            {repo.visibility === "private" && (
+                <label className="collab-panel-label">
+                    <input type="checkbox" checked={shareKey} onChange={(e) => setShareKey(e.target.checked)} />
+                    {" "}Also hand over the decryption key for <b>{repo.namespace}</b> — lets the agent read
+                    published notes, <b>cannot be revoked</b> (re-key by re-sealing every note)
+                </label>
+            )}
             <form className="collab-panel-actions" onSubmit={mint}>
                 <input
                     className="repo-input"
@@ -334,6 +491,15 @@ function AgentPanel({ repo, onClose }) {
                 <div className="agent-token">
                     <div>Copy it now — it is not stored and cannot be shown again.</div>
                     <code onClick={() => navigator.clipboard?.writeText(minted.token)}>{minted.token}</code>
+                    {minted.secret && (
+                        <>
+                            <div>
+                                Decryption key for <b>{repo.namespace}</b> — it decrypts and nothing else: it
+                                cannot spend, publish, or sign. Never give an agent your wallet key.
+                            </div>
+                            <code onClick={() => navigator.clipboard?.writeText(minted.secret)}>{minted.secret}</code>
+                        </>
+                    )}
                     <details>
                         <summary>Connect an agent</summary>
                         <div>Claude Code:</div>
@@ -421,6 +587,9 @@ export default function App({ address, onLogout }) {
     const [showAgents, setShowAgents] = useState(false);
     // Off-canvas sidebar; only ever visible on narrow screens (see styles.css).
     const [navOpen, setNavOpen] = useState(false);
+    // The Files view takes over the main pane (the editor stays mounted-in-state
+    // behind it, so closing it lands back on the same note).
+    const [showFiles, setShowFiles] = useState(false);
     // An incoming share link (?owner=&ns=&note=) — parsed once on mount.
     const [share, setShare] = useState(() => {
         const p = new URLSearchParams(window.location.search);
@@ -448,6 +617,38 @@ export default function App({ address, onLogout }) {
         setNavOpen(false); // on mobile the drawer covers the note you just picked
     }, []);
 
+    // A private namespace's published notes are ciphertext the relay can't write
+    // to disk, so a pull hands them back sealed and they're opened HERE, with the
+    // wallet key, and saved as the plaintext working copy (which is what a
+    // private repo's working tree has always been). This is the only path by
+    // which a private space published from somewhere else becomes readable on
+    // this instance — without it the sidebar is empty and the notes look lost.
+    //
+    // Notes another wallet sealed simply don't open. They're reported rather
+    // than stubbed: a placeholder saved into the tree would be published over
+    // the real note on the next publish.
+    const restoreSealed = useCallback(async (sealed, namespace) => {
+        const paths = Object.keys(sealed ?? {});
+        if (paths.length === 0) return 0;
+        setStatus({ kind: "busy", text: `unlocking ${paths.length} note(s)…` });
+        // Every write names its namespace. The signature prompt below is a long
+        // pause the user can spend switching spaces, and a save that resolved
+        // against the active pointer would land in whichever one they picked —
+        // one namespace's notes written into another's tree.
+        const secrets = await readSecrets(signForKey, namespace);
+        const failed = [];
+        for (const path of paths) {
+            const text = unsealAny(namespace, path, sealed[path], secrets);
+            if (text === null) { failed.push(path); continue; }
+            await api.save(path, text, namespace);
+        }
+        await refreshNotes();
+        if (failed.length) {
+            setStatus({ kind: "err", text: `couldn't decrypt ${failed.length} note(s) — sealed by a different wallet: ${failed.join(", ")}` });
+        }
+        return paths.length - failed.length;
+    }, [signForKey, refreshNotes]);
+
     // Load the active repo's pointer + notes and open its index (or first note).
     const loadActive = useCallback(async () => {
         const { active: activeNs, repos } = await api.repos();
@@ -455,6 +656,13 @@ export default function App({ address, onLogout }) {
         const current = repos.find((r) => r.namespace === activeNs) ?? null;
         setRepo(current);
         const list = await refreshNotes();
+        // An empty private space MIGHT be the "my notes are gone" case (adopted
+        // by discover, bodies still sealed on-chain) — but it is just as likely
+        // that the user deleted every note, and restoring here silently undid
+        // their delete on the next refresh. The two are indistinguishable from
+        // here, so it's a prompt, not an action: the Pull button already does
+        // the restore.
+        // (the empty-space banner in <main> offers the Pull that restores them)
         const first = list.find((n) => n.path === "index.md") ?? list[0];
         if (first) await openNote(first.path);
         else { setActive(null); setContent(""); setRenderText(""); }
@@ -577,13 +785,32 @@ export default function App({ address, onLogout }) {
         subscribe(ref);
     };
 
+    // This relay tracks repos in its own state, so a wallet that published from
+    // another instance (or before a volume was wiped) arrives to an empty list.
+    // Ask the chain what it actually owns.
+    const discover = async () => {
+        setStatus({ kind: "busy", text: "looking for your spaces on-chain…" });
+        try {
+            const { found } = await api.discoverRepos();
+            await loadActive();
+            setStatus(found.length
+                ? { kind: "ok", text: `found ${found.map((f) => f.namespace).join(", ")}` }
+                : { kind: "ok", text: "nothing new — this wallet has published nothing else" });
+        } catch (err) {
+            setStatus({ kind: "err", text: `sync failed: ${err.message}` });
+        }
+    };
+
     const pull = async () => {
         setStatus({ kind: "busy", text: "pulling from the network…" });
         try {
-            const { written } = await api.pull();
-            setNudges((n) => { const c = { ...n }; delete c[repo?.namespace]; return c; });
+            const ns = repo?.namespace;
+            const { written, sealed } = await api.pull(ns);
+            setNudges((n) => { const c = { ...n }; delete c[ns]; return c; });
             await refreshNotes();
-            setStatus({ kind: "ok", text: written.length ? `pulled ${written.length} note(s): ${written.join(", ")}` : "already up to date" });
+            const opened = await restoreSealed(sealed, ns);
+            const got = written.length + opened;
+            setStatus({ kind: "ok", text: got ? `pulled ${got} note(s)${written.length ? `: ${written.join(", ")}` : ""}` : "already up to date" });
         } catch (err) {
             setStatus({ kind: "err", text: `pull failed: ${err.message}` });
         }
@@ -642,7 +869,7 @@ export default function App({ address, onLogout }) {
             let sealed;
             if (repo?.visibility === "private") {
                 setStatus({ kind: "busy", text: "unlocking your encryption key…" });
-                const secret = await deriveSecret(signForKey);
+                const secret = await deriveSecret(signForKey, repo.namespace);
                 setStatus({ kind: "busy", text: "encrypting notes…" });
                 sealed = {};
                 for (const n of notes) {
@@ -652,7 +879,16 @@ export default function App({ address, onLogout }) {
             }
 
             setStatus({ kind: "busy", text: "preparing commit…" });
-            const { namespace, commitCid, staged, tx } = await api.publishPrepare(message, sealed);
+            // A publish is a snapshot, so notes missing locally leave the
+            // namespace. The server refuses until that's acknowledged — it's
+            // either the deletions you just made, or a working tree that never
+            // had them (a discovered private namespace).
+            const prepare = (confirmDrop) => api.publishPrepare(message, sealed, confirmDrop);
+            const { namespace, commitCid, staged, tx } = await prepare(false).catch((err) => {
+                if (!/would remove/.test(err.message)) throw err;
+                if (!window.confirm(`${err.message}\n\nThey stay in history, but drop out of the current wiki. Continue?`)) throw new Error("cancelled");
+                return prepare(true);
+            });
 
             // The server built the commit but holds no key: WE sign the one
             // settlement tx with our own wallet.
@@ -706,16 +942,42 @@ export default function App({ address, onLogout }) {
         }
     };
 
-    const deleteNoteAt = async (path) => {
-        if (!window.confirm(`Delete ${path}? It's removed from your working tree (published history is kept).`)) return;
+    // One or many — the same call, so the tree is rewritten once and the sidebar
+    // reopens on a note that still exists.
+    const deleteNotes = async (paths) => {
+        const what = paths.length === 1 ? paths[0] : `${paths.length} notes`;
+        if (!window.confirm(`Delete ${what}? Removed from your working tree; published versions leave the wiki on your next publish.`)) return;
         try {
-            await api.deleteNote(path);
+            const { deleted } = await api.deleteNotes(paths);
             const list = await refreshNotes();
-            if (active === path) {
+            if (deleted.includes(active)) {
                 const first = list.find((n) => n.path === "index.md") ?? list[0];
                 if (first) await openNote(first.path);
                 else { setActive(null); setContent(""); setRenderText(""); }
             }
+            setStatus({ kind: "ok", text: `deleted ${deleted.length} note(s)` });
+        } catch (err) {
+            setStatus({ kind: "err", text: `delete failed: ${err.message}` });
+        }
+    };
+
+    // Local delete: the relay forgets it and the working tree goes. Published
+    // commits are settled on-chain and stay readable by anyone who followed.
+    // `target` is any tracked space, not just the active one — the note count is
+    // only known for the one that's open, so the warning names it when it can.
+    const deleteRepo = async (target = repo) => {
+        if (!target) return;
+        const here = target.namespace === repo?.namespace ? ` and its ${notes.length} local note(s)` : "";
+        const warning = target.owner === address
+            ? target.head
+                ? `Delete "${target.namespace}"${here}?\n\nAlready published versions stay on-chain and readable — this app just stops tracking it. To empty the wiki first, delete the notes and publish.`
+                : `Delete "${target.namespace}"${here}? Nothing was ever published, so this is permanent.`
+            : `Stop following "${target.namespace}"? The owner's copy is untouched.`;
+        if (!window.confirm(warning)) return;
+        try {
+            await api.deleteRepo(target.namespace);
+            await loadActive();
+            setStatus({ kind: "ok", text: `${target.namespace} removed from this app` });
         } catch (err) {
             setStatus({ kind: "err", text: `delete failed: ${err.message}` });
         }
@@ -740,7 +1002,9 @@ export default function App({ address, onLogout }) {
             <aside className={`sidebar${navOpen ? " open" : ""}`}>
                 <div className="sidebar-head">
                     <span className="brand">🌲 fangornmd</span>
-                    <button className="btn small" onClick={newNote} title="New note">＋</button>
+                    <span className="sidebar-head-actions">
+                        {repo?.writable && <button className="btn small" onClick={newNote} title="New note">＋</button>}
+                    </span>
                 </div>
                 <div className="account-bar">
                     <button
@@ -763,6 +1027,8 @@ export default function App({ address, onLogout }) {
                     onSwitch={switchRepo}
                     onCreate={createRepo}
                     onFollow={followRepo}
+                    onDiscover={discover}
+                    onDelete={deleteRepo}
                 />
                 {/* ponytail: dropping on empty space is gone — drop "after" the
                     last row for the same result. */}
@@ -778,7 +1044,7 @@ export default function App({ address, onLogout }) {
                             onOpen={openNote}
                             onMove={moveNote}
                             onRename={renameNoteAt}
-                            onDelete={deleteNoteAt}
+                            onDelete={(path) => deleteNotes([path])}
                         />
                     ))}
                     {tree.length === 0 && <div className="tree-section">no notes yet</div>}
@@ -808,6 +1074,17 @@ export default function App({ address, onLogout }) {
                         <button className="btn ghost" onClick={() => { setShare(null); cleanShareUrl(); }}>Dismiss</button>
                     </div>
                 )}
+                {/* Nothing local. Either the notes were deleted, or they're
+                    published and this relay has never materialized them (a
+                    discovered space, or an agent that publishes the wiki from
+                    its own process). Restoring on its own would undo a delete,
+                    so the Pull is offered, not performed. */}
+                {repo?.writable && notes.length === 0 && (
+                    <div className="banner">
+                        <b>{repo.namespace}</b> is empty here. Anything published to it can be pulled back.
+                        <button className="btn" onClick={pull}>Pull</button>
+                    </div>
+                )}
                 {activeNudge && (
                     <div className="banner">
                         <b>{repo.namespace}</b> updated on-chain (block {activeNudge.blockNumber},{" "}
@@ -825,8 +1102,8 @@ export default function App({ address, onLogout }) {
                     >
                         ☰
                     </button>
-                    <span className="doc-title">{activeTitle ?? "—"}</span>
-                    {active && (
+                    <span className="doc-title">{showFiles ? "Files" : activeTitle ?? "—"}</span>
+                    {active && !showFiles && (
                         <div className="view-switch" role="group" aria-label="View">
                             {["edit", "split", "read"].map((m) => (
                                 <button
@@ -851,7 +1128,15 @@ export default function App({ address, onLogout }) {
                         <span className={`save-state ${saveState}`}>{saveState}</span>
                     )}
                     <span className="spacer" />
-                    {active && (
+                    <button
+                        className={`btn${showFiles ? " primary" : ""}`}
+                        onClick={() => setShowFiles((v) => !v)}
+                        aria-pressed={showFiles}
+                        title="All files — bulk select, rename, delete"
+                    >
+                        🗂 Files
+                    </button>
+                    {active && !showFiles && (
                         <>
                             <button
                                 className="btn"
@@ -895,7 +1180,12 @@ export default function App({ address, onLogout }) {
                     )}
                 </header>
                 {showAgents && repo?.isOwner && (
-                    <AgentPanel key={repo.namespace} repo={repo} onClose={() => setShowAgents(false)} />
+                    <AgentPanel
+                        key={repo.namespace}
+                        repo={repo}
+                        onClose={() => setShowAgents(false)}
+                        signForKey={signForKey}
+                    />
                 )}
                 {showCollabs && repo?.isOwner && (
                     <CollaboratorPanel
@@ -916,7 +1206,22 @@ export default function App({ address, onLogout }) {
                         <button className="btn ghost" onClick={() => setStatus(null)}>×</button>
                     </div>
                 )}
-                {active ? (
+                {showFiles ? (
+                    <FilesView
+                        // Paths are per-namespace: `index.md` exists in most of
+                        // them, so a pick carried across a switch would delete
+                        // the wrong file. Remounting drops the selection.
+                        key={repo?.namespace}
+                        notes={notes}
+                        tree={tree}
+                        active={active}
+                        writable={!!repo?.writable}
+                        onOpen={(path) => { setShowFiles(false); openNote(path); }}
+                        onRename={renameNoteAt}
+                        onDelete={deleteNotes}
+                        onClose={() => setShowFiles(false)}
+                    />
+                ) : active ? (
                     <>
                         {/* Everyone on a public namespace joins the live room —
                             read-only subscribers included, so they watch it

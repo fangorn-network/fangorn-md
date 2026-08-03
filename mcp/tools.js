@@ -95,16 +95,30 @@ export function createFangornmdServer({ call, base }) {
             description:
                 "Replace a note's entire contents (creates it if new). If someone has the note open, the text " +
                 "appears in their editor as you write it — so read_note immediately before, and send back the " +
-                "whole document, not a fragment. This is a draft: it is not published until a human signs it.",
+                "whole document, not a fragment. This is a draft: it is not published until a human signs it. " +
+                "Pass `parent` to file the note under another note instead of leaving it loose at the top level — " +
+                "that hierarchy is the sidebar, and it is what gets published as the wiki's structure.",
             inputSchema: {
                 path: z.string().describe("note filename, e.g. index.md — created if it does not exist"),
                 content: z.string().describe("the complete new markdown for the note"),
+                // Filenames are flat and unique wiki-wide: one namespace is one
+                // Fangorn subspace, and a note's identity is its filename. So
+                // grouping is a parent, not a directory — `notes/a.md` is not a
+                // path this accepts. Prefix the filename if you want the group
+                // in the name too (research-tokens.md under research.md).
+                parent: z.string().optional().describe(
+                    "filename of an existing note to nest this one under, e.g. research.md. " +
+                    "Omit to leave it at the top level; list_notes shows the current hierarchy.",
+                ),
                 namespace: nsArg,
             },
         },
-        async ({ path, content, namespace }) => {
-            const r = await call("PUT", `/api/notes/${encodeURIComponent(path)}${nsQuery(namespace)}`, { content });
-            return text(r.live ? `Wrote ${path} — it is open in someone's editor, so they just saw it change.` : `Wrote ${path}.`);
+        async ({ path, content, parent, namespace }) => {
+            const r = await call("PUT", `/api/notes/${encodeURIComponent(path)}${nsQuery(namespace)}`, { content, parent });
+            const where = r.parent ? ` under ${r.parent}` : "";
+            return text(r.live
+                ? `Wrote ${path}${where} — it is open in someone's editor, so they just saw it change.`
+                : `Wrote ${path}${where}.`);
         },
     );
 

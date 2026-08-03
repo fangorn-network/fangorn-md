@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import {
-    readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, watch, rmSync, renameSync,
+    readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, watch, rmSync, renameSync, statSync,
 } from "node:fs";
 import { join, dirname, extname, normalize } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
@@ -16,6 +16,9 @@ import { createFangornmdServer, httpCall } from "../mcp/tools.js";
 // Shared with the browser: one renderer for the pane, the export and the
 // published page, so a public URL can't drift from what the author saw.
 import { publicPage } from "../src/render.js";
+// Same pure tree transform the sidebar's drag-and-drop uses — an agent nesting a
+// note under a parent is the "inside" drop, minus the pointer events.
+import { moveInTree } from "../src/structure.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 //
@@ -202,7 +205,25 @@ function userStore(address) {
         active() { const r = this.activeOrNull(); if (!r) throw new HttpError(404, "no active repo — create one first"); return r; },
         setActive(ns) { const s = read(); if (!s.repos[ns]) throw new HttpError(404, `no such repo: ${ns}`); s.active = ns; write(s); },
         setHead(ns, cid) { const s = read(); s.repos[ns].head = cid; write(s); },
-        add(repo) { const s = read(); s.repos[repo.namespace] = repo; s.active = repo.namespace; write(s); },
+        add(repo) {
+            const s = read();
+            s.repos[repo.namespace] = repo;
+            s.active = repo.namespace;
+            s.forgotten = (s.forgotten ?? []).filter((n) => n !== repo.namespace); // asked for it back
+            write(s);
+        },
+        // Stop tracking a namespace. On-chain it stays where it is — nothing can
+        // unpublish a settled commit — so `forgotten` records the intent, or the
+        // next discover sweep would hand it straight back.
+        forget(ns) {
+            const s = read();
+            if (!s.repos[ns]) throw new HttpError(404, `no such repo: ${ns}`);
+            delete s.repos[ns];
+            if (s.active === ns) s.active = Object.keys(s.repos)[0] ?? null;
+            s.forgotten = [...new Set([...(s.forgotten ?? []), ns])];
+            write(s);
+        },
+        forgotten: () => new Set(read().forgotten ?? []),
         setCollaborators(ns, list) {
             const s = read();
             if (!s.repos[ns]) throw new HttpError(404, `no such repo: ${ns}`);
@@ -309,6 +330,26 @@ function reconcileTree(repo) {
 }
 
 const writeTree = (repo, tree) => writeFileSync(treePath(repo), JSON.stringify(tree, null, 2), "utf-8");
+/**
+ * The parent has to be a real note, and checking that BEFORE the write is what
+ * keeps a typo'd `parent` from leaving a stray note behind on the way to a 404.
+ */
+function assertParent(repo, path, parent) {
+    assertNotePath(parent);
+    if (parent === path) throw new HttpError(400, "a note cannot be its own parent");
+    if (!existsSync(join(docsDir(repo), parent))) throw new HttpError(404, `no such parent note: ${parent}`);
+}
+
+/** File `path` under `parent` in the stored tree and persist it. */
+function placeUnder(repo, path, parent) {
+    const { tree } = reconcileTree(repo);
+    const next = moveInTree(tree, path, parent, "inside");
+    // moveInTree no-ops on an invalid drop — the only one reachable here is
+    // nesting a note under its own descendant, which would orphan a subtree.
+    if (next === tree) throw new HttpError(409, `${parent} is inside ${path} — that would detach the subtree`);
+    writeTree(repo, next);
+}
+
 // Rename a note's path everywhere it appears in the stored tree.
 const renameInTree = (tree, from, to) =>
     tree.map((n) => ({ path: n.path === from ? to : n.path, children: renameInTree(n.children, from, to) }));
@@ -364,7 +405,8 @@ Welcome to your new wiki. This note is **index.md** — the root of your tree.
 - Just write — markdown renders as you type, and changes autosave.
 - Add pages with **+**, then **drag them in the sidebar** to nest and reorder.
   That hierarchy is what gets published — no link-wrangling required.
-- Hover a page in the sidebar to **rename** (✎) or **delete** (✕) it.
+- Hover a page in the sidebar to **rename** (✎) or **delete** (✕) it, or open
+  **🗂 Files** to filter, shift-click a range and delete in bulk.
 - \`[[wikilinks]]\` still work for cross-references — ⌘/Ctrl-click one to jump.
 - Hit **Publish** to snapshot everything to the Fangorn network (you sign one
   transaction from your own wallet — the server never holds your keys).
@@ -392,6 +434,42 @@ async function remoteState(repo) {
     const { tip, contents: raw } = await fangorn.readNamespace(repo.owner, repo.namespace);
     const contents = { ...raw, vertices: raw.vertices.map(decodeVertex) };
     return { tip, contents, latest: latestByPath(contents) };
+}
+
+/** Remove one note from a working tree. The caller rewrites the tree after. */
+function removeNote(repo, path) {
+    const file = join(docsDir(repo), path);
+    if (!existsSync(file)) throw new HttpError(404, `no such note: ${path}`);
+    closeRoom(repo.owner, repo.namespace, path); // before the unlink, or the room writes it back
+    rmSync(file);
+}
+
+/**
+ * Write a namespace's published notes into its working tree.
+ *
+ * Sealed notes can't be written here — the key is in the owner's browser — so
+ * they come back as ciphertext for the caller to open and save (see
+ * `restoreSealed` in App.jsx). Only ones with no local file: an existing file
+ * is the newer plaintext, and replacing it with the published version would eat
+ * unpublished edits.
+ */
+function pullRepo(repo, latest) {
+    const dir = docsDir(repo);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const written = [];
+    const sealed = {};
+    for (const [path, v] of latest) {
+        if (path !== TREE_FILE) assertNotePath(path); // the tree manifest rides along too
+        const file = join(dir, path);
+        if (v.payload.enc !== undefined) {
+            if (!existsSync(file)) sealed[path] = v.payload.enc;
+            continue;
+        }
+        if (existsSync(file) && readFileSync(file, "utf-8") === v.payload.content) continue;
+        writeFileSync(file, v.payload.content, "utf-8");
+        written.push(path);
+    }
+    return { written, sealed };
 }
 
 // ─── Live events (SSE) ────────────────────────────────────────────────────────
@@ -479,9 +557,16 @@ const routes = {
         const dir = relDir(address, namespace);
         const abs = join(DATA_DIR, dir);
         mkdirSync(abs, { recursive: true });
+        // A namespace this wallet has already published to is an ADOPTION, not a
+        // new space — an agent publishing a wiki under your own address is the
+        // usual way to get one. Its notes are on-chain and sealed, so only the
+        // browser can write them, and a boilerplate index stamped here makes the
+        // tree look non-empty — which hides the empty-space Pull banner that is
+        // the only way those published pages get materialized.
+        const tip = await fangorn.onChainTip(address, namespace).catch(() => null);
         const index = join(abs, "index.md");
-        if (!existsSync(index)) writeFileSync(index, indexBoilerplate(namespace), "utf-8");
-        s.add({ namespace, owner: address, head: null, visibility, dir });
+        if (!tip && !existsSync(index)) writeFileSync(index, indexBoilerplate(namespace), "utf-8");
+        s.add({ namespace, owner: address, head: tip ?? null, visibility, dir });
         return publicRepo(s.active(), address);
     },
 
@@ -563,7 +648,9 @@ const routes = {
         const notes = paths.map((path) => {
             const content = readFileSync(join(dir, path), "utf-8");
             const links = [...new Set(extractMarkdownLinks(content).map((id) => `${id}.md`))].filter((t) => t !== path && known.has(t));
-            return { path, title: firstHeading(content, path.replace(/\.md$/, "")), links };
+            // mtime/size are for the Files view's columns; the editor ignores them.
+            const { mtimeMs, size } = statSync(join(dir, path));
+            return { path, title: firstHeading(content, path.replace(/\.md$/, "")), links, updatedAt: mtimeMs, size };
         });
         return { notes, tree: reconcileTree(repo).tree };
     },
@@ -591,32 +678,62 @@ const routes = {
         return { path, content: readFileSync(file, "utf-8"), live: false };
     },
 
+    // `parent` (optional) files the note under another note in the stored tree —
+    // the hierarchy agents otherwise can't reach, since reconcileTree appends
+    // every new file as an unfiled root. Notes stay flat on disk: a namespace is
+    // one Fangorn subspace and vertex identity is the filename, so nesting is
+    // structure, not a path.
     "PUT /api/notes/:path": async (p) => {
-        const { path, body } = p;
+        const { address, path, body } = p;
         if (typeof body.content !== "string") throw new HttpError(400, "content required");
         const repo = repoFor(p);
+        // The three sibling write routes all check this; without it a read-only
+        // follower can overwrite a note in their mirror but not rename it.
+        if (!canEdit(repo, address)) throw new HttpError(403, "read-only — ask the owner to add you as a collaborator");
+        if (body.parent != null) assertParent(repo, path, String(body.parent));
+
         const live = openRoom(repo, path);
         if (live) {
             replaceMarkdown(live.doc, live.xml, body.content);
             live.doc.flushToDisk?.(); // don't wait out the debounce to answer "saved"
-            return { path, saved: true, live: true };
+        } else {
+            const dir = docsDir(repo);
+            if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+            writeFileSync(join(dir, path), body.content, "utf-8");
         }
-        const dir = docsDir(repo);
-        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-        writeFileSync(join(dir, path), body.content, "utf-8");
-        return { path, saved: true, live: false };
+        // After the write, so reconcileTree sees a brand-new note as a root to
+        // move rather than a file it doesn't know about yet.
+        if (body.parent != null) placeUnder(repo, path, String(body.parent));
+        return { path, saved: true, live: !!live, parent: body.parent ?? null };
     },
 
     "DELETE /api/notes/:path": async (p) => {
         const { address, path } = p;
         const repo = repoFor(p);
         if (!canEdit(repo, address)) throw new HttpError(403, "read-only — ask the owner to add you as a collaborator");
-        const file = join(docsDir(repo), path);
-        if (!existsSync(file)) throw new HttpError(404, `no such note: ${path}`);
-        closeRoom(repo.owner, repo.namespace, path); // before the unlink, or the room writes it back
-        rmSync(file);
+        removeNote(repo, path);
         writeTree(repo, reconcileTree(repo).tree); // prune the now-missing node
         return { deleted: path };
+    },
+
+    // Multi-select delete. One tree rewrite for the whole set rather than one
+    // per note — and one round trip, so the sidebar can't render a half-done
+    // selection while the rest are still in flight.
+    "POST /api/notes/delete": async (p) => {
+        const { address, body } = p;
+        const repo = repoFor(p);
+        if (!canEdit(repo, address)) throw new HttpError(403, "read-only — ask the owner to add you as a collaborator");
+        const paths = (body.paths ?? []).map(String);
+        if (!Array.isArray(body.paths) || paths.length === 0) throw new HttpError(400, "paths array required");
+        for (const path of paths) assertNotePath(path);
+        const deleted = [];
+        for (const path of paths) {
+            if (!existsSync(join(docsDir(repo), path))) continue; // already gone is the desired state
+            removeNote(repo, path);
+            deleted.push(path);
+        }
+        writeTree(repo, reconcileTree(repo).tree);
+        return { deleted };
     },
 
     // Rename in place: move the file and rewrite its path throughout the tree.
@@ -656,23 +773,75 @@ const routes = {
         const repo = repoFor(p);
         // A collaborator already lives in the owner's live tree — pulling would
         // overwrite everyone's in-flight drafts with the last published snapshot.
-        if (repo.owner !== address && canEdit(repo, address)) return { written: [], skippedEncrypted: [], shared: true };
-        const { latest } = await remoteState(repo);
-        const dir = docsDir(repo);
-        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-        const written = [];
-        const skippedEncrypted = [];
-        for (const [path, v] of latest) {
-            if (path !== TREE_FILE) assertNotePath(path); // the tree manifest rides along too
-            // Encrypted notes only decrypt in the owner's browser — the server
-            // must never overwrite local plaintext with the "🔒" placeholder.
-            if (v.payload.enc !== undefined) { skippedEncrypted.push(path); continue; }
-            const file = join(dir, path);
-            if (existsSync(file) && readFileSync(file, "utf-8") === v.payload.content) continue;
-            writeFileSync(file, v.payload.content, "utf-8");
-            written.push(path);
+        if (repo.owner !== address && canEdit(repo, address)) return { written: [], sealed: {}, shared: true };
+        const { tip, latest } = await remoteState(repo);
+        // Record the tip we just read. Settling is not the only way to learn the
+        // head — a namespace tracked by discover, or followed, has one already —
+        // and a stale `null` reads as "never published" everywhere it's used.
+        if (tip && tip !== repo.head) userStore(address).setHead(repo.namespace, tip);
+        return pullRepo(repo, latest);
+    },
+
+    // Stop tracking a namespace, and delete its working tree if it's yours.
+    //
+    // This is a LOCAL delete. Published commits are content-addressed and
+    // settled on-chain: the head still points at them and anyone who followed
+    // this namespace still reads it. Nothing here reaches the network — the
+    // closest thing to unpublishing is emptying the working tree and publishing
+    // that (a snapshot with nothing in it), which the caller can do first.
+    "POST /api/repos/delete": async (p) => {
+        assertHuman(p); // an agent can write notes; dropping a whole space is the human's call
+        const { address, body } = p;
+        const s = userStore(address);
+        const namespace = String(body.namespace ?? "").trim();
+        const repo = s.get(namespace);
+        // A collaborator's `dir` resolves to the OWNER's tree — removing it here
+        // would delete someone else's notes because you left their namespace.
+        const dir = join(DATA_DIR, relDir(address, namespace));
+        if (repo.owner === address && existsSync(dir)) {
+            // Close the live rooms first: a room outlives the file and would
+            // write its note back the moment someone's tab flushes.
+            for (const f of readdirSync(dir, { withFileTypes: true }))
+                if (f.isFile()) closeRoom(address, namespace, f.name);
+            rmSync(dir, { recursive: true, force: true });
         }
-        return { written, skippedEncrypted };
+        s.forget(namespace);
+        return { deleted: namespace, onChain: repo.head ?? null };
+    },
+
+    // Rebuild this wallet's repo list from the chain.
+    //
+    // The repo list is per-relay state (a user file under DATA_DIR); the
+    // namespaces are on-chain. So the same wallet on a second instance — a local
+    // dev server, a fresh volume — logs in to an empty UI while its wikis sit
+    // right there on-chain. One `getLogs` recovers every subspace this address
+    // has committed under. The event carries only keccak(name), so the name
+    // comes from each commit's own root map.
+    "POST /api/repos/discover": async ({ address }) => {
+        const s = userStore(address);
+        const known = s.read().repos;
+        const forgotten = s.forgotten(); // deleted on purpose — don't hand them back
+        const found = [];
+        for (const { root } of await fangorn.appNamespaces({ owner: address })) {
+            // A commit spanning several namespaces predates per-namespace
+            // timelines and can't be named — skip it rather than fail the sweep.
+            const namespace = await fangorn.engine.namespaceOf(root).catch(() => null);
+            if (!namespace || known[namespace] || forgotten.has(namespace)) continue;
+            const { tip, contents, latest } = await remoteState({ owner: address, namespace });
+            // Sealed bodies only open in the owner's browser, so the server can't
+            // tell private from public by reading — but `enc` says so in the
+            // clear. Guessing "public" here would publish the whole namespace
+            // unsealed on the next publish.
+            const visibility = contents.vertices.some((v) => v.payload?.enc !== undefined) ? "private" : "public";
+            const dir = relDir(address, namespace);
+            mkdirSync(join(DATA_DIR, dir), { recursive: true });
+            s.add({ namespace, owner: address, head: tip, visibility, dir });
+            // Sealed notes stay sealed here — they're opened when the browser
+            // makes that namespace active and can sign for its key.
+            const { written, sealed } = pullRepo(s.get(namespace), latest);
+            found.push({ namespace, visibility, written, sealed: Object.keys(sealed).length });
+        }
+        return { found };
     },
 
     // ── Self-custodial publish: prepare (keyless, server) → sign+send (browser)
@@ -698,6 +867,20 @@ const routes = {
         writeTree(repo, tree);
         const graph = buildWikiGraph(docsDir(repo), latest, childrenByPath);
         if (graph.vertices.length === 0) throw new HttpError(400, `${repo.dir}/ has no markdown files`);
+
+        // A publish is a SNAPSHOT (`replace: true` below), which is the only way
+        // deleting a note can mean anything: staging just the files that exist
+        // leaves the deleted note's last version in the namespace, and the next
+        // pull writes it straight back.
+        //
+        // The hazard is the same property in reverse — a working tree that's
+        // missing notes it never had drops them from the namespace. That's
+        // exactly the state after discovering a PRIVATE namespace, whose sealed
+        // bodies the relay can't materialize. So the drop set is named and has
+        // to be acknowledged; history keeps the old versions either way.
+        const staged = new Set(graph.vertices.map((v) => v.payload.path));
+        const drops = [...latest.keys()].filter((path) => path !== TREE_FILE && !staged.has(path));
+        if (drops.length > 0 && !body.confirmDrop) throw new HttpError(409, `publishing would remove ${drops.length} published note(s): ${drops.join(", ")}`);
 
         // Private repo: the browser sealed each note (content → hex `enc`) with a
         // key only it holds. Swap content→enc before it hits the commit — the
@@ -729,6 +912,7 @@ const routes = {
                 vertices: graph.vertices,
                 edges: graph.edges,
                 message: body.message || "update wiki",
+                replace: true,
             });
         } catch (err) {
             if (/revert/i.test(err.message)) throw new HttpError(409, `settlement would revert (root moved on-chain?) — pull and retry: ${err.message}`);
@@ -902,7 +1086,9 @@ const server = createServer(async (req, res) => {
     // target per call instead of carrying it in the credential.
     const params = { ns: url.searchParams.get("ns") || null };
     const renameMatch = url.pathname.match(/^\/api\/notes\/(.+)\/rename$/);
-    const noteMatch = url.pathname.match(/^\/api\/notes\/(.+)$/);
+    // A literal route wins over the `:path` pattern, or /api/notes/delete parses
+    // as a note named "delete".
+    const noteMatch = routes[key] ? null : url.pathname.match(/^\/api\/notes\/(.+)$/);
     if (renameMatch) {
         params.path = decodeURIComponent(renameMatch[1]);
         key = `${req.method} /api/notes/:path/rename`;
