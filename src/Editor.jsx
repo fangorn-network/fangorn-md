@@ -384,10 +384,18 @@ export default function Editor({ content, onChange, onNavigate, noteKey, readOnl
     const editor = useMemo(() => withHistory(withReact(createEditor())), [noteKey]);
     const initialValue = useMemo(() => toSlate(content), [noteKey]);
 
+    // The text we last lifted to App. App echoes it straight back as `content`,
+    // and re-seeding the editor from our own echo is what dropped the Android
+    // keyboard on every space: Gboard commits the composition, Slate's Android
+    // manager flushes on the next frame, and in that window `isFocused` reads
+    // false — so the effect below deselected and replaced `children` mid-word.
+    const lastEmitted = useRef(content);
+
     // External update to the *open* note (a pull while viewing): App only sends
     // one when the buffer isn't dirty, but guard on focus too so we never yank
     // the cursor mid-keystroke.
     useEffect(() => {
+        if (content === lastEmitted.current) return; // our own echo, not a pull
         if (ReactEditor.isFocused(editor)) return;
         if (content === fromSlate(editor.children)) return;
         Transforms.deselect(editor);
@@ -396,7 +404,9 @@ export default function Editor({ content, onChange, onNavigate, noteKey, readOnl
     }, [content, editor]);
 
     const onSlateChange = () => {
-        if (editor.operations.some((op) => op.type !== "set_selection")) onChange(fromSlate(editor.children));
+        if (!editor.operations.some((op) => op.type !== "set_selection")) return;
+        lastEmitted.current = fromSlate(editor.children);
+        onChange(lastEmitted.current);
     };
 
     return (
