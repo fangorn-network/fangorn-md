@@ -58,10 +58,12 @@ const CONFIG = { ...FangornConfig, appId: APP_ID };
 const fangorn = Fangorn.create({
     privateKey: process.env.ETH_PRIVATE_KEY,
     // storage: { pinata: { jwt: process.env.PINATA_JWT, gateway: process.env.PINATA_GATEWAY } },
-    storage: { signedUrl: {
-        workerUrl: 'https://sepolia.storage-worker.fangorn.network',
-        gateway: process.env.PINATA_GATEWAY,
-    } },
+    storage: {
+        signedUrl: {
+            workerUrl: 'https://sepolia.storage-worker.fangorn.network',
+            gateway: process.env.PINATA_GATEWAY,
+        }
+    },
     domain: "localhost",
     config: CONFIG,
 });
@@ -738,7 +740,11 @@ const routes = {
             namespace: repo.namespace,
             commitCid: prepared.commitCid,
             staged: prepared.staged,
-            tx: prepared.tx,
+            // The SDK builds its public client without a `chain`, so the tx it
+            // hands back carries `chainId: undefined` — which reaches the browser
+            // as a missing field and makes Privy's switchChain(Number(undefined))
+            // fail with "chainId NaN". The chain is fixed by config; fill it in.
+            tx: { ...prepared.tx, chainId: prepared.tx.chainId ?? CONFIG.chain.id },
         };
     },
 
