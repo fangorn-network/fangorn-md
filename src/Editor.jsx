@@ -351,6 +351,12 @@ function MarkdownSlate({
                             onPaste={handleImage}
                             onDrop={handleImage}
                             spellCheck={false}
+                            // Gboard autocorrects on space: it replaces the word
+                            // just composed, and that replacement has to be
+                            // mapped back onto decorated leaves (zero-width
+                            // syntax spans included). Off, a space is a space.
+                            autoCorrect="false"
+                            autoCapitalize="off"
                             placeholder="Write here… markdown renders as you type"
                         />
                     </div>

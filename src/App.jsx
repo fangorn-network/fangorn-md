@@ -467,6 +467,23 @@ export default function App({ address, onLogout }) {
             setStatus({ kind: "err", text: `server unreachable: ${err.message}` }));
     }, [loadActive]);
 
+    // A phone has no console, so an exception thrown inside an event handler —
+    // Slate's input path especially — is invisible: the editor just stops
+    // behaving and there's nothing to read. Surface it in the status bar, which
+    // is already the place this app says things went wrong.
+    useEffect(() => {
+        const onErr = (e) => setStatus({
+            kind: "err",
+            text: `js: ${e.message ?? e.reason?.message ?? String(e.reason)}`,
+        });
+        window.addEventListener("error", onErr);
+        window.addEventListener("unhandledrejection", onErr);
+        return () => {
+            window.removeEventListener("error", onErr);
+            window.removeEventListener("unhandledrejection", onErr);
+        };
+    }, []);
+
     // Autosave: every keystroke marks the note dirty; 600ms of quiet flushes it
     // to disk. Publishing is a separate, explicit act.
     const onChange = (next) => {
