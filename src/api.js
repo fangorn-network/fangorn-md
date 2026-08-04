@@ -55,11 +55,14 @@ export const api = {
     // pointer. Any write that spans an await the user can interrupt — a wallet
     // prompt, most of all — must name it, or the switch they make while waiting
     // redirects the write into whatever namespace is active when it lands.
-    save: async (path, content, ns) =>
+    // `parent` files the new note under another note in the stored tree — the
+    // same "inside" drop the drag does, which is how a note gets created
+    // already nested instead of created then dragged.
+    save: async (path, content, ns, parent) =>
         fetch(`/api/notes/${encodeURIComponent(path)}${ns ? `?ns=${encodeURIComponent(ns)}` : ""}`, {
             method: "PUT",
             headers: await authHeaders({ "Content-Type": "application/json" }),
-            body: JSON.stringify({ content }),
+            body: JSON.stringify(parent ? { content, parent } : { content }),
         }).then(json),
     deleteNote: async (path) =>
         fetch(`/api/notes/${encodeURIComponent(path)}`, { method: "DELETE", headers: await authHeaders() }).then(json),

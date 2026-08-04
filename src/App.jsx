@@ -3,14 +3,14 @@ import { usePrivy, useWallets, useSignMessage } from "@privy-io/react-auth";
 import { api, setTokenGetter, setAddress } from "./api.js";
 import { deriveSecret, deriveSecretHex, sealContent, readSecrets, unsealAny } from "./crypto.js";
 import { useEvents } from "./useEvents.js";
-import { buildBacklinks, flattenTree, moveInTree, pathsBetween } from "./structure.js";
+import { ancestorsOf, buildBacklinks, flattenTree, foldTree, moveInTree, pathsBetween } from "./structure.js";
 import Editor, { CollabEditor } from "./Editor.jsx";
 import { exportHtml } from "./render.js";
 
 const short = (s) => (s ? `${s.slice(0, 8)}…${s.slice(-6)}` : "");
 
 // ponytail: Intl.RelativeTimeFormat, no date library. Coarse on purpose — the
-// Files column answers "did I touch this recently", not "when exactly".
+// home view's date answers "did I touch this recently", not "when exactly".
 const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 const UNITS = [["year", 31536e6], ["month", 2592e6], ["day", 864e5], ["hour", 36e5], ["minute", 6e4]];
 function ago(ms) {
@@ -68,36 +68,36 @@ export function parseRepoRef(input) {
     return m ? { owner: m[1], ns: m[2].trim(), note: null } : null;
 }
 
-// Reordering the tree runs on pointer events, not HTML5 drag-and-drop: DnD
-// never fires for touch, so the sidebar was desktop-only. Dragging starts from
-// a grip (the only element with `touch-action: none`) so a finger anywhere else
-// on the row still scrolls the list.
+// Reordering runs on pointer events, not HTML5 drag-and-drop: DnD never fires
+// for touch. Dragging starts from a grip (the only element with
+// `touch-action: none`) so a finger anywhere else on the row still scrolls.
 //
 // The drop marker is a class on the row under the pointer. It's feedback that
 // lasts exactly as long as the gesture and nothing re-renders mid-drag, so it
-// stays a DOM class rather than React state threaded down the recursion.
+// stays a DOM class rather than React state threaded through the list.
 const DROP_MARKS = ["drop-before", "drop-inside", "drop-after"];
 const clearMarks = () =>
-    document.querySelectorAll(".tree-row").forEach((el) => el.classList.remove(...DROP_MARKS));
+    document.querySelectorAll(".home-row").forEach((el) => el.classList.remove(...DROP_MARKS));
 
 // The row under (x, y) and which third of it, or null if it isn't a drop.
 function dropAt(x, y, dragPath) {
-    const el = document.elementFromPoint(x, y)?.closest?.(".tree-row");
+    const el = document.elementFromPoint(x, y)?.closest?.(".home-row");
     if (!el?.dataset.path || el.dataset.path === dragPath) return null;
     const r = el.getBoundingClientRect();
     const f = (y - r.top) / r.height;
     return { el, path: el.dataset.path, zone: f < 0.3 ? "before" : f > 0.7 ? "after" : "inside" };
 }
 
-// One node of the explicit page tree (stored server-side; see structure.js),
-// rendered recursively. Writers can drag to reorder/nest and rename/delete.
-function TreeRow({ node, depth, notes, active, writable, onOpen, onMove, onRename, onDelete }) {
+// One row of the space home. The path back to the open note is drawn as lit
+// grain rails, so a note nested four levels down still shows you which branch
+// it hangs off without expanding anything.
+function HomeRow({ row, note, active, lineage, writable, picked, onOpen, onToggle, onPick, onMove, onRename, onDelete, onNest }) {
     const drag = useRef(null); // { x, y, id, started } while a drag is live
     // A drag that ends where it began still emits a click, which would open the
     // note you were only trying to move. Cleared on the next pointerdown, so a
     // gesture that never produces a click can't eat a later one.
     const justDragged = useRef(false);
-    const title = notes.find((n) => n.path === node.path)?.title ?? node.path.replace(/\.md$/, "");
+    const node = row;
 
     // Capture belongs on the ROW, never on the grip: the grip lives inside
     // `.tree-actions`, which is `display:none` until the row is hovered, and a
@@ -143,68 +143,100 @@ function TreeRow({ node, depth, notes, active, writable, onOpen, onMove, onRenam
         if (hit) onMove(node.path, hit.path, hit.zone);
     };
 
+    const cls = ["home-row"];
+    if (row.path === active) cls.push("active");
+    if (lineage) cls.push("lineage");
+    if (picked) cls.push("picked");
+
     return (
-        <>
-            <div
-                className="tree-row"
-                data-path={node.path}
-                onPointerDown={onPointerDown}
-                onPointerMove={onPointerMove}
-                onPointerUp={onPointerUp}
-                onPointerCancel={(e) => { drag.current = null; e.currentTarget.classList.remove("dragging"); clearMarks(); }}
-            >
-                <button
-                    className={`note-item ${node.path === active ? "active" : ""}`}
-                    style={{ paddingLeft: `${10 + depth * 16}px` }}
-                    onClick={() => { if (!justDragged.current) onOpen(node.path); }}
-                    title={node.path}
-                >
-                    <span className="tree-glyph">{depth > 0 ? "└ " : ""}</span>
-                    {title}
-                </button>
-                {writable && (
-                    <span className="tree-actions">
-                        <button className="tree-act" title="Rename" onClick={() => onRename(node.path)}>✎</button>
-                        <button className="tree-act" title="Delete" onClick={() => onDelete(node.path)}>✕</button>
-                        <button className="tree-act tree-grip" title="Drag to reorder">⠿</button>
-                    </span>
-                )}
-            </div>
-            {node.children.map((child) => (
-                <TreeRow
-                    key={child.path}
-                    node={child}
-                    depth={depth + 1}
-                    notes={notes}
-                    active={active}
-                    writable={writable}
-                    onOpen={onOpen}
-                    onMove={onMove}
-                    onRename={onRename}
-                    onDelete={onDelete}
+        <div
+            className={cls.join(" ")}
+            data-path={node.path}
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={onPointerUp}
+            onPointerCancel={(e) => { drag.current = null; e.currentTarget.classList.remove("dragging"); clearMarks(); }}
+        >
+            {writable && (
+                <input
+                    type="checkbox"
+                    className="home-pick tree-act"
+                    checked={picked}
+                    onChange={(e) => onPick(row.path, e.nativeEvent)}
+                    onClick={(e) => e.stopPropagation()}
+                    aria-label={`Select ${note.title}`}
                 />
+            )}
+            {/* One rail per level of nesting — the grain the whole view reads by.
+                The innermost is tagged: CSS can't find it on its own, because
+                `:last-of-type` picks the last <span> in the row, which is never
+                a rail. */}
+            {Array.from({ length: row.depth }, (_, i) => (
+                <span key={i} className={i === row.depth - 1 ? "grain tip" : "grain"} />
             ))}
-        </>
+            {row.count > 0 ? (
+                <button
+                    className="twist tree-act"
+                    aria-expanded={row.open}
+                    aria-label={`${row.open ? "Collapse" : "Expand"} ${note.title}`}
+                    onClick={() => onToggle(row.path)}
+                >
+                    {row.open ? "▾" : "▸"}
+                </button>
+            ) : (
+                <span className="twist" aria-hidden="true" />
+            )}
+            <button
+                className="home-title"
+                onClick={() => { if (!justDragged.current) onOpen(node.path); }}
+                title={`Open ${node.path}`}
+            >
+                {note.title}
+            </button>
+            <span className="home-count">{row.count > 0 && !row.open ? row.count : ""}</span>
+            <span className="home-when">{note.updatedAt ? ago(note.updatedAt) : ""}</span>
+            {writable && (
+                <span className="tree-actions">
+                    {/* Nesting used to be drag-only, which is undiscoverable and
+                        impossible to do accurately on a phone. The server has
+                        always taken a `parent` on create — this just asks for it. */}
+                    <button className="tree-act" title={`New document under ${note.title}`} onClick={() => onNest(node.path)}>＋</button>
+                    <button className="tree-act" title="Rename" onClick={() => onRename(node.path)}>✎</button>
+                    <button className="tree-act" title="Delete" onClick={() => onDelete(node.path)}>✕</button>
+                    <button className="tree-act tree-grip" title="Drag to reorder">⠿</button>
+                </span>
+            )}
+        </div>
     );
 }
 
-// The Files view: every note in the namespace as one table, in tree order.
-// It exists because the 240px sidebar can't be a file manager and a navigation
-// rail at once — bulk selection, paths and dates need the width of the main
-// pane, and the sidebar goes back to being a list you click.
-function FilesView({ notes, tree, active, writable, onOpen, onRename, onDelete, onClose }) {
-    const [selection, setSelection] = useState(() => new Set());
+// One collection's documents, browsable, in the width of the main pane. This is
+// the answer to a 240px rail trying to be a file manager, a collection switcher
+// and a nav list at once — folding keeps a 200-document collection to a screen
+// of rows, and the same view works on a phone because it isn't in a drawer.
+function CollectionHome({ notes, tree, active, writable, repo, onPull, onOpen, onMove, onRename, onDelete, onNew }) {
+    // Land on the branch the open note lives on. Everything else starts folded,
+    // which is the whole point — the old view rendered every note, always.
+    const [open, setOpen] = useState(() => new Set(ancestorsOf(tree, active) ?? []));
     const [query, setQuery] = useState("");
-    const anchor = useRef(null); // last row clicked, for shift-click ranges
+    const [selection, setSelection] = useState(() => new Set());
+    const anchor = useRef(null); // last row picked, for shift-click ranges
 
     const byPath = useMemo(() => new Map(notes.map((n) => [n.path, n])), [notes]);
+    const lineage = useMemo(() => new Set(ancestorsOf(tree, active) ?? []), [tree, active]);
+
+    // A filter searches the whole namespace, so it ignores folding and goes flat —
+    // matches you can't see aren't matches.
     const rows = useMemo(() => {
         const q = query.trim().toLowerCase();
-        return flattenTree(tree)
+        const base = q
+            ? flattenTree(tree).map((r) => ({ ...r, depth: 0, count: 0, open: false }))
+            : foldTree(tree, open);
+        return base
             .map((r) => ({ ...r, note: byPath.get(r.path) }))
             .filter((r) => r.note)
             .filter((r) => !q || r.path.toLowerCase().includes(q) || r.note.title.toLowerCase().includes(q));
-    }, [tree, byPath, query]);
+    }, [tree, open, byPath, query]);
 
     // Selecting a note that's since been deleted (or filtered out of the tree)
     // would send a dead path to the bulk delete, so the set is derived, never
@@ -214,7 +246,21 @@ function FilesView({ notes, tree, active, writable, onOpen, onRename, onDelete, 
         [selection, byPath],
     );
 
-    const click = (path, e) => {
+    const toggle = (path) =>
+        setOpen((o) => { const n = new Set(o); n.has(path) ? n.delete(path) : n.add(path); return n; });
+
+    // Dropping a note INSIDE a collapsed parent folds it out of sight the
+    // instant it lands, which reads as "nesting is broken / my note is gone".
+    // The parent opens so you see where it went.
+    const move = (dragPath, targetPath, pos) => {
+        if (pos === "inside") setOpen((o) => new Set(o).add(targetPath));
+        onMove(dragPath, targetPath, pos);
+    };
+
+    // The row opens the note; only the checkbox selects. The old view had this
+    // backwards — clicking a row selected it and only the title opened it,
+    // which is not what a list of documents should do.
+    const pick = (path, e) => {
         const next = new Set(picked);
         if (e.shiftKey && anchor.current) {
             for (const p of pathsBetween(rows, anchor.current, path)) next.add(p);
@@ -225,83 +271,313 @@ function FilesView({ notes, tree, active, writable, onOpen, onRename, onDelete, 
         setSelection(next);
     };
 
-    const allShown = rows.length > 0 && rows.every((r) => picked.has(r.path));
     const chosen = [...picked];
+    const allShown = rows.length > 0 && rows.every((r) => picked.has(r.path));
 
     return (
-        <div className="files">
-            <div className="files-bar">
+        <div className="home">
+            {/* A published collection whose working tree is thinner than its commit is
+                indistinguishable, from here, from one you emptied on purpose —
+                so this offers the Pull rather than performing it. The empty-collection
+                banner only fires at zero notes and never covered this case. */}
+            {writable && repo?.head && (
+                <div className="home-note">
+                    <span>
+                        Published as <code>{short(repo.head)}</code>. Notes published from elsewhere
+                        won't be here until you pull them.
+                    </span>
+                    <button className="btn ghost small" onClick={onPull}>Pull</button>
+                </div>
+            )}
+
+            <div className="home-bar">
                 <input
-                    className="files-search"
+                    className="home-search"
                     type="search"
-                    placeholder="Filter by title or filename…"
+                    placeholder="Filter this collection by title or path…"
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
-                    autoFocus
                 />
-                <button
-                    className="btn ghost small"
-                    onClick={() => setSelection(allShown ? new Set() : new Set(rows.map((r) => r.path)))}
-                    disabled={rows.length === 0}
-                >
-                    {allShown ? "none" : "all"}
-                </button>
-                <span className="files-count">
-                    {picked.size > 0 ? `${picked.size} selected` : `${rows.length} note${rows.length === 1 ? "" : "s"}`}
+                <span className="home-tally">
+                    {notes.length} document{notes.length === 1 ? "" : "s"} in {repo?.namespace ?? "—"}
                 </span>
-                {writable && picked.size === 1 && (
-                    <button className="btn small" onClick={() => onRename(chosen[0])}>Rename</button>
-                )}
-                {writable && (
-                    <button className="btn small danger" disabled={picked.size === 0} onClick={() => onDelete(chosen)}>
-                        Delete
-                    </button>
-                )}
-                <button className="btn ghost small" onClick={onClose} title="Back to the editor">✕</button>
+                {writable && <button className="btn small" onClick={() => onNew()}>New document</button>}
             </div>
-            <div className="files-table" role="grid">
-                {rows.map(({ path, depth, note }) => (
-                    <div
-                        key={path}
-                        role="row"
-                        className={`files-row${picked.has(path) ? " picked" : ""}${path === active ? " active" : ""}`}
-                        onClick={(e) => click(path, e)}
+
+            {/* Bulk actions only exist once something is selected, so browsing
+                isn't shadowed by a Delete button that does nothing. */}
+            {picked.size > 0 && (
+                <div className="home-bulk">
+                    <span className="home-tally">{picked.size} selected</span>
+                    <button
+                        className="btn ghost small"
+                        onClick={() => setSelection(allShown ? new Set() : new Set(rows.map((r) => r.path)))}
                     >
-                        <input
-                            type="checkbox"
-                            className="files-check"
-                            checked={picked.has(path)}
-                            onChange={() => {}}  // the row owns the click, so this is state, not a hit target
-                            tabIndex={-1}
-                            aria-label={`Select ${note.title}`}
-                        />
-                        <button
-                            className="files-title"
-                            style={{ paddingLeft: `${depth * 18}px` }}
-                            // Opening is the one action that must not be swallowed
-                            // by the row's select handler.
-                            onClick={(e) => { e.stopPropagation(); onOpen(path); }}
-                            title={`Open ${path}`}
-                        >
-                            <span className="tree-glyph">{depth > 0 ? "└ " : ""}</span>
-                            {note.title}
-                        </button>
-                        <span className="files-path">{path}</span>
-                        <span className="files-when">{note.updatedAt ? ago(note.updatedAt) : ""}</span>
-                    </div>
+                        {allShown ? "Clear" : "Select all"}
+                    </button>
+                    {picked.size === 1 && <button className="btn small" onClick={() => onRename(chosen[0])}>Rename</button>}
+                    <button className="btn small danger" onClick={() => onDelete(chosen)}>Delete</button>
+                </div>
+            )}
+
+            <div className="home-list">
+                {rows.map((row) => (
+                    <HomeRow
+                        key={row.path}
+                        row={row}
+                        note={row.note}
+                        active={active}
+                        lineage={lineage.has(row.path)}
+                        writable={writable}
+                        picked={picked.has(row.path)}
+                        onOpen={onOpen}
+                        onToggle={toggle}
+                        onPick={pick}
+                        onMove={move}
+                        onRename={onRename}
+                        onDelete={(p) => onDelete([p])}
+                        onNest={(p) => { setOpen((o) => new Set(o).add(p)); onNew(p); }}
+                    />
                 ))}
                 {rows.length === 0 && (
-                    <div className="files-empty">{query ? "nothing matches that filter" : "no notes yet"}</div>
+                    <div className="home-empty">
+                        {query
+                            ? <>Nothing here matches “{query}”.</>
+                            : writable
+                                ? <>This collection is empty. <button className="btn small" onClick={() => onNew()}>Write the first document</button></>
+                                : <>Nothing published here yet.</>}
+                    </div>
                 )}
             </div>
         </div>
     );
 }
 
-// The repo switcher: every tracked Fangorn namespace, plus inline forms to
-// create one on your own root (public or private/encrypted) or follow someone
-// else's read-only. A dot marks repos with an unseen on-chain update.
-function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow, onDiscover, onDelete }) {
+// The root of the browser: every collection this wallet tracks, as rows in the
+// same view its notes use one level down. Pills were a second navigation model
+// bolted beside the first — this is just the top of the same tree, so the
+// breadcrumb, the row shape and the click target all keep meaning what they
+// meant. Counts are absent on purpose: only the open collection's documents are
+// loaded, and a made-up number is worse than none.
+function CollectionList({ repos, active, nudges, address, onOpen, onDelete }) {
+    const [query, setQuery] = useState("");
+    const q = query.trim().toLowerCase();
+    const rows = repos.filter((r) => !q || r.namespace.toLowerCase().includes(q));
+
+    return (
+        <div className="home">
+            <div className="home-bar">
+                <input
+                    className="home-search"
+                    type="search"
+                    placeholder="Filter collections…"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                />
+                <span className="home-tally">
+                    {repos.length} collection{repos.length === 1 ? "" : "s"}
+                </span>
+            </div>
+            <div className="home-list">
+                {rows.map((r) => (
+                    <div key={r.namespace} className={`home-row coll-row${r.namespace === active ? " active" : ""}`}>
+                        <button className="home-title coll-title" onClick={() => onOpen(r.namespace)} title={`Open ${r.namespace}`}>
+                            {r.namespace}
+                        </button>
+                        {nudges?.[r.namespace] && r.namespace !== active && (
+                            <span className="repo-dot" title="updated on-chain since you last looked" />
+                        )}
+                        {/* Three facts that change what this collection IS, so
+                            they're words rather than icons you have to learn. */}
+                        <span className={`coll-tag ${r.visibility}`}>
+                            {r.visibility === "private" ? "private" : "public"}
+                        </span>
+                        <span className="coll-tag">
+                            {r.owner === address ? "owner" : r.writable ? "collaborator" : "read-only"}
+                        </span>
+                        <span className="coll-head" title={r.head ?? "nothing settled on-chain yet"}>
+                            {r.head ? short(r.head) : "unpublished"}
+                        </span>
+                        <span className="tree-actions">
+                            <button
+                                className="tree-act"
+                                title={r.owner === address ? `Delete ${r.namespace}` : `Stop following ${r.namespace}`}
+                                onClick={() => onDelete(r)}
+                            >
+                                ✕
+                            </button>
+                        </span>
+                    </div>
+                ))}
+                {rows.length === 0 && (
+                    <div className="home-empty">
+                        {query ? <>No collection matches “{query}”.</> : <>No collections yet.</>}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+// The open collection's structure, in the sidebar, while you write. The main
+// browser is for managing (bulk select, rename, reorder); this is for moving.
+// It only works now because folding exists — the version that rendered every
+// descendant unconditionally is what made a large collection unusable here.
+function SideTree({ tree, notes, active, onOpen }) {
+    const [open, setOpen] = useState(() => new Set(ancestorsOf(tree, active) ?? []));
+
+    // Opening a note from anywhere else — ⌘K, a breadcrumb, a backlink — has to
+    // reveal it here too, or the sidebar quietly disagrees with the editor.
+    // Returning the same Set when nothing is new keeps this from re-rendering
+    // itself forever.
+    useEffect(() => {
+        const trail = ancestorsOf(tree, active) ?? [];
+        if (trail.length === 0) return;
+        setOpen((o) => (trail.every((p) => o.has(p)) ? o : new Set([...o, ...trail])));
+    }, [tree, active]);
+
+    const lineage = useMemo(() => new Set(ancestorsOf(tree, active) ?? []), [tree, active]);
+    const rows = useMemo(() => foldTree(tree, open), [tree, open]);
+    const byPath = useMemo(() => new Map(notes.map((n) => [n.path, n])), [notes]);
+
+    const toggle = (path) =>
+        setOpen((o) => { const n = new Set(o); n.has(path) ? n.delete(path) : n.add(path); return n; });
+
+    if (rows.length === 0) return <div className="side-empty">No documents yet.</div>;
+
+    return (
+        <div className="side-tree">
+            {rows.map((row) => {
+                const note = byPath.get(row.path);
+                if (!note) return null;
+                return (
+                    <div
+                        key={row.path}
+                        className={`side-row${row.path === active ? " active" : ""}${lineage.has(row.path) ? " lineage" : ""}`}
+                    >
+                        {Array.from({ length: row.depth }, (_, i) => (
+                            <span key={i} className={i === row.depth - 1 ? "grain tip" : "grain"} />
+                        ))}
+                        {row.count > 0 ? (
+                            <button
+                                className="twist tree-act"
+                                aria-expanded={row.open}
+                                aria-label={`${row.open ? "Collapse" : "Expand"} ${note.title}`}
+                                onClick={() => toggle(row.path)}
+                            >
+                                {row.open ? "▾" : "▸"}
+                            </button>
+                        ) : (
+                            <span className="twist" aria-hidden="true" />
+                        )}
+                        <button className="side-title" onClick={() => onOpen(row.path)} title={row.path}>
+                            {note.title}
+                        </button>
+                    </div>
+                );
+            })}
+        </div>
+    );
+}
+
+// One popover, two jobs: the collection switcher and the topbar's overflow menu.
+// A scrim rather than a document listener — it closes on any outside tap,
+// which is the behaviour a phone needs and an outside-click handler fumbles.
+function Popover({ label, title, className, panelClass, children }) {
+    const [open, setOpen] = useState(false);
+    return (
+        <div className={`pop ${className ?? ""}`}>
+            <button className="btn ghost pop-trigger" title={title} aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+                {label}
+            </button>
+            {open && (
+                <>
+                    <div className="pop-scrim" onClick={() => setOpen(false)} />
+                    <div className={`pop-panel ${panelClass ?? ""}`}>{children(() => setOpen(false))}</div>
+                </>
+            )}
+        </div>
+    );
+}
+
+// Where a note is: its title's position in the namespace, and the substring that
+// matched. Negative means no match at all.
+const rank = (q, title, path) => {
+    if (!q) return 0;
+    const t = title.toLowerCase().indexOf(q);
+    if (t >= 0) return t;
+    const p = path.toLowerCase().indexOf(q);
+    return p >= 0 ? 100 + p : -1;
+};
+
+// ⌘K. Every document in the open collection plus every collection you track —
+// the fastest path to anything, and the only navigation on a phone that
+// doesn't cost a drawer, a scroll and three taps.
+function JumpPalette({ notes, repos, activeNs, onOpen, onSwitch, onClose }) {
+    const [q, setQ] = useState("");
+    const [i, setI] = useState(0);
+
+    const hits = useMemo(() => {
+        const s = q.trim().toLowerCase();
+        const found = [
+            ...notes.map((n) => ({ kind: "note", id: n.path, label: n.title, hint: n.path, score: rank(s, n.title, n.path) })),
+            ...repos
+                .filter((r) => r.namespace !== activeNs)
+                .map((r) => ({ kind: "coll", id: r.namespace, label: r.namespace, hint: "switch collection", score: rank(s, r.namespace, r.namespace) })),
+        ];
+        return found.filter((h) => h.score >= 0).sort((a, b) => a.score - b.score).slice(0, 12);
+    }, [q, notes, repos, activeNs]);
+
+    const choose = (hit) => {
+        if (!hit) return;
+        onClose();
+        hit.kind === "coll" ? onSwitch(hit.id) : onOpen(hit.id);
+    };
+
+    const onKeyDown = (e) => {
+        if (e.key === "ArrowDown") { e.preventDefault(); setI((v) => Math.min(v + 1, hits.length - 1)); }
+        else if (e.key === "ArrowUp") { e.preventDefault(); setI((v) => Math.max(v - 1, 0)); }
+        else if (e.key === "Enter") { e.preventDefault(); choose(hits[i]); }
+        else if (e.key === "Escape") onClose();
+    };
+
+    return (
+        <div className="jump-scrim" onClick={onClose}>
+            <div className="jump" onClick={(e) => e.stopPropagation()}>
+                <input
+                    className="jump-input"
+                    placeholder="Jump to a document or a collection…"
+                    value={q}
+                    onChange={(e) => { setQ(e.target.value); setI(0); }}
+                    onKeyDown={onKeyDown}
+                    autoFocus
+                />
+                <ul className="jump-hits">
+                    {hits.map((h, n) => (
+                        <li key={`${h.kind}:${h.id}`}>
+                            <button
+                                className={`jump-hit${n === i ? " on" : ""}`}
+                                onMouseEnter={() => setI(n)}
+                                onClick={() => choose(h)}
+                            >
+                                <span className={`jump-kind ${h.kind}`}>{h.kind === "coll" ? "set" : "doc"}</span>
+                                <span className="jump-label">{h.label}</span>
+                                <span className="jump-hint">{h.hint}</span>
+                            </button>
+                        </li>
+                    ))}
+                    {hits.length === 0 && <li className="home-empty">No document or collection matches “{q}”.</li>}
+                </ul>
+            </div>
+        </div>
+    );
+}
+
+// The collection switcher: create, subscribe, sync. Browsing what you have is
+// the root of the main view now, so this menu is only for the actions. It shared the
+// sidebar with the note tree before, and two unbounded lists in 240px is why
+// neither one was navigable.
+function CollectionMenu({ repos, active, nudges, onSwitch, onCreate, onFollow, onDiscover, onDelete, close }) {
     const [form, setForm] = useState(null); // "new" | "follow" | null
     const [name, setName] = useState("");
     const [visibility, setVisibility] = useState("public");
@@ -311,24 +587,19 @@ function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow, onDiscov
         e.preventDefault();
         if (!name.trim()) return;
         onCreate(name.trim(), visibility);
-        setName(""); setVisibility("public"); setForm(null);
+        setName(""); setVisibility("public"); setForm(null); close();
     };
     const submitFollow = (e) => {
         e.preventDefault();
         if (!ref.trim()) return;
         onFollow(ref.trim());
-        setRef(""); setForm(null);
+        setRef(""); setForm(null); close();
     };
 
     return (
         <div className="repo-bar">
             <div className="repo-bar-head">
-                <span className="repo-bar-label">your data</span>
-                <span className="repo-bar-actions">
-                    <button className="btn ghost small" title="New — create a space for your notes" onClick={() => setForm(form === "new" ? null : "new")}>＋</button>
-                    <button className="btn ghost small" title="Subscribe to someone else's space" onClick={() => setForm(form === "follow" ? null : "follow")}>⌕</button>
-                    <button className="btn ghost small" title="Sync — find spaces this wallet published on-chain" onClick={onDiscover}>↻</button>
-                </span>
+                <span className="repo-bar-label">your collections</span>
             </div>
             <div className="repo-switch">
                 {repos.map((r) => (
@@ -340,7 +611,7 @@ function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow, onDiscov
                     <div key={r.namespace} className={`repo-row ${r.namespace === active ? "active" : ""}`}>
                         <button
                             className="repo-item"
-                            onClick={() => onSwitch(r.namespace)}
+                            onClick={() => { onSwitch(r.namespace); close(); }}
                             title={`${r.namespace} · owner ${r.owner}`}
                         >
                             <span className="repo-name">{r.namespace}</span>
@@ -363,19 +634,45 @@ function RepoBar({ repos, active, nudges, onSwitch, onCreate, onFollow, onDiscov
                     </div>
                 ))}
             </div>
+            {/* These were three unlabelled icons in a corner. Creating a collection —
+                and picking whether it's public or encrypted — is the most
+                consequential choice in the app; it gets words. */}
+            <div className="repo-acts">
+                <button className="menu-item" onClick={() => setForm(form === "new" ? null : "new")}>
+                    ＋ New collection…
+                </button>
+                <button className="menu-item" onClick={() => setForm(form === "follow" ? null : "follow")}>
+                    ⌕ Subscribe to a collection…
+                </button>
+                <button className="menu-item" onClick={() => { onDiscover(); close(); }}>
+                    ↻ Find my collections on-chain
+                </button>
+            </div>
+
             {form === "new" && (
                 <form className="repo-form" onSubmit={submitNew}>
-                    <input className="repo-input" placeholder="name it (e.g. My Recipes)" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
-                    <select className="repo-input" value={visibility} onChange={(e) => setVisibility(e.target.value)}>
-                        <option value="public">public</option>
-                        <option value="private">private (encrypted)</option>
-                    </select>
-                    <button className="btn small primary" type="submit">Create</button>
+                    <input className="repo-input" placeholder="Name it (e.g. My Recipes)" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+                    <label className="repo-field">
+                        <span className="repo-bar-label">who can read it</span>
+                        <select className="repo-input" value={visibility} onChange={(e) => setVisibility(e.target.value)}>
+                            <option value="public">Public — anyone can read</option>
+                            <option value="private">Private — encrypted</option>
+                        </select>
+                    </label>
+                    {/* Visibility is fixed at creation and decides whether the
+                        network ever sees plaintext, so it says so up front
+                        rather than in a doc nobody opens. */}
+                    <p className="repo-hint">
+                        {visibility === "private"
+                            ? "Notes are sealed with a key derived from your wallet. The server pins ciphertext it cannot read. This can't be changed later."
+                            : "Notes publish as plaintext anyone can read and verify. This can't be changed later."}
+                    </p>
+                    <button className="btn small primary" type="submit">Create collection</button>
                 </form>
             )}
             {form === "follow" && (
                 <form className="repo-form" onSubmit={submitFollow}>
-                    <input className="repo-input" placeholder="paste a share link or owner/name" value={ref} onChange={(e) => setRef(e.target.value)} autoFocus />
+                    <input className="repo-input" placeholder="Paste a share link, or owner/name" value={ref} onChange={(e) => setRef(e.target.value)} autoFocus />
                     <button className="btn small primary" type="submit">Subscribe</button>
                 </form>
             )}
@@ -417,9 +714,9 @@ function CollaboratorPanel({ repo, onSave, onClose }) {
 // Never able to publish — that needs the wallet, which is here and not wherever
 // the agent is running.
 //
-// The default reaches every wiki you have, so connecting an agent is something
+// The default reaches every collection you have, so connecting an agent is something
 // you do once rather than once per namespace. Pinning is offered for the token
-// you hand to somebody else's agent, where one wiki is the whole point.
+// you hand to somebody else's agent, where one collection is the whole point.
 function AgentPanel({ repo, onClose, signForKey }) {
     const [tokens, setTokens] = useState([]);
     const [name, setName] = useState("");
@@ -458,15 +755,15 @@ function AgentPanel({ repo, onClose, signForKey }) {
     return (
         <div className="collab-panel">
             <label className="collab-panel-label">
-                Agent tokens — an agent holding one can read and write your notes, and names which wiki it
-                means per request. Set it up once; new wikis need no new token. It cannot publish: that
+                Agent tokens — an agent holding one can read and write your notes, and names which collection it
+                means per request. Set it up once; new collections need no new token. It cannot publish: that
                 needs your wallet.
             </label>
             <label className="collab-panel-label">
                 <input type="checkbox" checked={pinned} onChange={(e) => setPinned(e.target.checked)} />
                 {" "}Limit this token to <b>{repo.namespace}</b> — for an agent that isn't yours
             </label>
-            {/* Only private wikis have anything sealed to hand a key for. The
+            {/* Only private collections have anything sealed to hand a key for. The
                 warning is not decoration: a token is a row in a file and dies
                 when you revoke it, but a key that has left this tab has read
                 every version ever published and cannot be called back. */}
@@ -521,7 +818,7 @@ function AgentPanel({ repo, onClose, signForKey }) {
                 <ul className="agent-token-list">
                     {tokens.map((t) => (
                         <li key={t.hash}>
-                            {t.name} · {t.namespace ?? "all wikis"} · {new Date(t.createdAt).toLocaleDateString()}
+                            {t.name} · {t.namespace ?? "all collections"} · {new Date(t.createdAt).toLocaleDateString()}
                             <button className="btn ghost small" onClick={() => revoke(t.hash)}>Revoke</button>
                         </li>
                     ))}
@@ -587,9 +884,10 @@ export default function App({ address, onLogout }) {
     const [showAgents, setShowAgents] = useState(false);
     // Off-canvas sidebar; only ever visible on narrow screens (see styles.css).
     const [navOpen, setNavOpen] = useState(false);
-    // The Files view takes over the main pane (the editor stays mounted-in-state
-    // behind it, so closing it lands back on the same note).
-    const [showFiles, setShowFiles] = useState(false);
+    // The space home takes over the main pane (the editor's state lives up here,
+    // so leaving home lands back on the same note, unedited).
+    const [home, setHome] = useState(false);
+    const [jump, setJump] = useState(false);
     // An incoming share link (?owner=&ns=&note=) — parsed once on mount.
     const [share, setShare] = useState(() => {
         const p = new URLSearchParams(window.location.search);
@@ -615,6 +913,7 @@ export default function App({ address, onLogout }) {
         setRenderText(note.content);
         setSaveState("saved");
         setNavOpen(false); // on mobile the drawer covers the note you just picked
+        setHome(false);
     }, []);
 
     // A private namespace's published notes are ciphertext the relay can't write
@@ -690,6 +989,16 @@ export default function App({ address, onLogout }) {
             window.removeEventListener("error", onErr);
             window.removeEventListener("unhandledrejection", onErr);
         };
+    }, []);
+
+    // ⌘K / Ctrl-K from anywhere, including with the caret inside the editor —
+    // capture, so Slate doesn't get to swallow it first.
+    useEffect(() => {
+        const onKey = (e) => {
+            if (e.key === "k" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); setJump((v) => !v); }
+        };
+        window.addEventListener("keydown", onKey, true);
+        return () => window.removeEventListener("keydown", onKey, true);
     }, []);
 
     // Autosave: every keystroke marks the note dirty; 600ms of quiet flushes it
@@ -859,7 +1168,7 @@ export default function App({ address, onLogout }) {
     };
 
     const publish = async () => {
-        const message = window.prompt("Commit message", "update wiki");
+        const message = window.prompt("Commit message", "update documents");
         if (message === null) return;
         try {
             const started = Date.now();
@@ -886,7 +1195,7 @@ export default function App({ address, onLogout }) {
             const prepare = (confirmDrop) => api.publishPrepare(message, sealed, confirmDrop);
             const { namespace, commitCid, staged, tx } = await prepare(false).catch((err) => {
                 if (!/would remove/.test(err.message)) throw err;
-                if (!window.confirm(`${err.message}\n\nThey stay in history, but drop out of the current wiki. Continue?`)) throw new Error("cancelled");
+                if (!window.confirm(`${err.message}\n\nThey stay in history, but drop out of the current collection. Continue?`)) throw new Error("cancelled");
                 return prepare(true);
             });
 
@@ -907,12 +1216,16 @@ export default function App({ address, onLogout }) {
         }
     };
 
-    const newNote = async () => {
-        const name = window.prompt("Note name (e.g. ideas)");
+    // `parent` (optional) creates the note already nested under another one.
+    const newNote = async (parent) => {
+        // Looked up inline, not via titleOf: that's declared further down, and
+        // a handler this one is passed to must not depend on the ordering.
+        const under = parent ? ` under ${notes.find((n) => n.path === parent)?.title ?? parent}` : "";
+        const name = window.prompt(`Document name${under} (e.g. ideas)`);
         if (!name) return;
         const path = name.endsWith(".md") ? name : `${name}.md`;
         try {
-            await api.save(path, `# ${name.replace(/\.md$/, "")}\n\n`);
+            await api.save(path, `# ${name.replace(/\.md$/, "")}\n\n`, undefined, parent);
             await refreshNotes();
             await openNote(path);
         } catch (err) {
@@ -931,7 +1244,7 @@ export default function App({ address, onLogout }) {
     };
 
     const renameNoteAt = async (path) => {
-        const to = window.prompt("Rename note to", path.replace(/\.md$/, ""));
+        const to = window.prompt("Rename document to", path.replace(/\.md$/, ""));
         if (!to) return;
         try {
             const { path: newPath } = await api.renameNote(path, to);
@@ -946,12 +1259,14 @@ export default function App({ address, onLogout }) {
     // reopens on a note that still exists.
     const deleteNotes = async (paths) => {
         const what = paths.length === 1 ? paths[0] : `${paths.length} notes`;
-        if (!window.confirm(`Delete ${what}? Removed from your working tree; published versions leave the wiki on your next publish.`)) return;
+        if (!window.confirm(`Delete ${what}? Removed from your working tree; published versions leave the collection on your next publish.`)) return;
         try {
             const { deleted } = await api.deleteNotes(paths);
             const list = await refreshNotes();
             if (deleted.includes(active)) {
-                const first = list.find((n) => n.path === "index.md") ?? list[0];
+                // Deleting from the home view must not fling you into an
+                // editor — you're mid-cleanup. Just drop the open note.
+                const first = home ? null : list.find((n) => n.path === "index.md") ?? list[0];
                 if (first) await openNote(first.path);
                 else { setActive(null); setContent(""); setRenderText(""); }
             }
@@ -970,7 +1285,7 @@ export default function App({ address, onLogout }) {
         const here = target.namespace === repo?.namespace ? ` and its ${notes.length} local note(s)` : "";
         const warning = target.owner === address
             ? target.head
-                ? `Delete "${target.namespace}"${here}?\n\nAlready published versions stay on-chain and readable — this app just stops tracking it. To empty the wiki first, delete the notes and publish.`
+                ? `Delete "${target.namespace}"${here}?\n\nAlready published versions stay on-chain and readable — this app just stops tracking it. To empty the collection first, delete the notes and publish.`
                 : `Delete "${target.namespace}"${here}? Nothing was ever published, so this is permanent.`
             : `Stop following "${target.namespace}"? The owner's copy is untouched.`;
         if (!window.confirm(warning)) return;
@@ -988,8 +1303,24 @@ export default function App({ address, onLogout }) {
         else setStatus({ kind: "err", text: `no such note: ${path}` });
     };
 
-    const activeTitle = notes.find((n) => n.path === active)?.title ?? active;
+    const titleOf = (path) => notes.find((n) => n.path === path)?.title ?? path?.replace(/\.md$/, "");
+    const activeTitle = titleOf(active);
     const exportDoc = () => exportHtml(renderText, activeTitle ?? "note");
+    // Where you are, spelled out. The old topbar showed a bare title, which in a
+    // deep tree tells you nothing about which branch you're on.
+    const crumbs = useMemo(
+        () => (active ? [...(ancestorsOf(tree, active) ?? []), active] : []),
+        [tree, active],
+    );
+    // Publishing settles ONE collection, so the button says which one — and how
+    // much of it is pending. A collection that was never published counts as all
+    // of it, because none of it exists off this disk yet.
+    const pending = useMemo(() => {
+        if (!repo?.isOwner) return 0;
+        if (!repo.head) return notes.length;
+        return notes.filter((n) => (n.updatedAt ?? 0) > (repo.syncedAt ?? 0)).length;
+    }, [repo, notes]);
+
     const backlinks = useMemo(() => buildBacklinks(notes), [notes]);
     const activeBacklinks = (backlinks.get(active) ?? []).map((p) => ({
         path: p,
@@ -1000,68 +1331,92 @@ export default function App({ address, onLogout }) {
     return (
         <div className="app">
             <aside className={`sidebar${navOpen ? " open" : ""}`}>
-                <div className="sidebar-head">
-                    <span className="brand">🌲 fangornmd</span>
-                    <span className="sidebar-head-actions">
-                        {repo?.writable && <button className="btn small" onClick={newNote} title="New note">＋</button>}
-                    </span>
-                </div>
-                <div className="account-bar">
-                    <button
-                        className="account-addr"
-                        title={address ? `${address} — click to copy` : "no wallet"}
-                        disabled={!address}
-                        onClick={() => {
-                            navigator.clipboard?.writeText(address);
-                            setStatus({ kind: "ok", text: "wallet address copied" });
-                        }}
-                    >
-                        {address ? short(address) : "no wallet"}
-                    </button>
-                    <button className="btn ghost small" onClick={onLogout} title="Log out">log out</button>
-                </div>
-                <RepoBar
-                    repos={repos}
-                    active={repo?.namespace}
-                    nudges={nudges}
-                    onSwitch={switchRepo}
-                    onCreate={createRepo}
-                    onFollow={followRepo}
-                    onDiscover={discover}
-                    onDelete={deleteRepo}
-                />
-                {/* ponytail: dropping on empty space is gone — drop "after" the
-                    last row for the same result. */}
-                <nav className="note-list">
-                    {tree.map((node) => (
-                        <TreeRow
-                            key={node.path}
-                            node={node}
-                            depth={0}
-                            notes={notes}
-                            active={active}
-                            writable={!!repo?.writable}
-                            onOpen={openNote}
-                            onMove={moveNote}
-                            onRename={renameNoteAt}
-                            onDelete={(path) => deleteNotes([path])}
+                {/* One hierarchy at a time. Collections and their documents are
+                    both levels of the main view; what's left here is the short
+                    list you actually move between while writing. */}
+                <Popover
+                    className="coll-pop"
+                    panelClass="coll-panel"
+                    title="Switch collection, create one, or subscribe to someone else's"
+                    label={
+                        <>
+                            <span className="brand-mark">🌲</span>
+                            <span className="coll-name">{repo?.namespace ?? "fangornmd"}</span>
+                            {repo?.visibility === "private" && <span className="repo-badge" title="private (encrypted)">🔒</span>}
+                            {repo && !repo.writable && <span className="repo-badge" title="read-only subscription">👁</span>}
+                            <span className="pop-caret">▾</span>
+                        </>
+                    }
+                >
+                    {(close) => (
+                        <CollectionMenu
+                            repos={repos}
+                            active={repo?.namespace}
+                            nudges={nudges}
+                            onSwitch={switchRepo}
+                            onCreate={createRepo}
+                            onFollow={followRepo}
+                            onDiscover={discover}
+                            onDelete={deleteRepo}
+                            close={close}
                         />
-                    ))}
-                    {tree.length === 0 && <div className="tree-section">no notes yet</div>}
+                    )}
+                </Popover>
+
+                <button className="jump-open" onClick={() => setJump(true)}>
+                    <span>⌕ Jump to anything</span>
+                    <kbd>⌘K</kbd>
+                </button>
+
+                <nav className="rail">
+                    {/* Not "All notes": this shows ONE namespace, and a label that
+                        implied every namespace is why `second brain` looked missing. */}
+                    <button className={`rail-item${home === "root" ? " active" : ""}`} onClick={() => setHome("root")}>
+                        ⌂ All collections
+                    </button>
+                    <button className={`rail-item${home === "space" ? " active" : ""}`} onClick={() => setHome("space")}>
+                        ☰ This collection
+                    </button>
+                    {repo?.writable && <button className="rail-item" onClick={() => newNote()}>＋ New document</button>}
+
+                    {/* The open collection's structure, not a recents list: you
+                        navigate by where a document sits far more than by when
+                        you last touched it. */}
+                    {repo && <div className="rail-label">{repo.namespace}</div>}
+                    <SideTree tree={tree} notes={notes} active={!home ? active : null} onOpen={openNote} />
                 </nav>
-                {repo && (
-                    <footer className="repo-info">
-                        <div>
-                            <b>{repo.namespace}</b> · {repo.visibility}
-                            {repo.isOwner ? "" : repo.writable ? " · collaborator" : " · read-only"}
-                        </div>
-                        <div title={repo.owner}>owner {short(repo.owner)}</div>
-                        {repo.isOwner && repo.collaborators?.length > 0 && (
-                            <div title={repo.collaborators.join("\n")}>{repo.collaborators.length} collaborator(s)</div>
-                        )}
-                        <div title={repo.head ?? ""}>head {repo.head ? short(repo.head) : "(none)"}</div>
-                    </footer>
-                )}
+
+                <footer className="repo-info">
+                    {repo && (
+                        <>
+                            <div>
+                                {repo.visibility}
+                                {repo.isOwner ? " · owner" : repo.writable ? " · collaborator" : " · read-only"}
+                                {repo.isOwner && repo.collaborators?.length > 0 && ` · ${repo.collaborators.length} collaborator(s)`}
+                            </div>
+                            {/* A published collection has a head; an unpublished one
+                                says so, because that's what decides whether any
+                                of this exists outside your disk. */}
+                            <div className="repo-head" title={repo.head ?? "nothing published yet"}>
+                                {repo.head ? `⛓ ${short(repo.head)}` : "◦ unpublished"}
+                            </div>
+                        </>
+                    )}
+                    <div className="account-bar">
+                        <button
+                            className="account-addr"
+                            title={address ? `${address} — click to copy` : "no wallet"}
+                            disabled={!address}
+                            onClick={() => {
+                                navigator.clipboard?.writeText(address);
+                                setStatus({ kind: "ok", text: "wallet address copied" });
+                            }}
+                        >
+                            {address ? short(address) : "no wallet"}
+                        </button>
+                        <button className="btn ghost small" onClick={onLogout} title="Log out">Log out</button>
+                    </div>
+                </footer>
             </aside>
             {navOpen && <div className="nav-backdrop" onClick={() => setNavOpen(false)} />}
 
@@ -1076,7 +1431,7 @@ export default function App({ address, onLogout }) {
                 )}
                 {/* Nothing local. Either the notes were deleted, or they're
                     published and this relay has never materialized them (a
-                    discovered space, or an agent that publishes the wiki from
+                    discovered collection, or an agent that publishes it from
                     its own process). Restoring on its own would undo a delete,
                     so the Pull is offered, not performed. */}
                 {repo?.writable && notes.length === 0 && (
@@ -1097,13 +1452,49 @@ export default function App({ address, onLogout }) {
                     <button
                         className="btn ghost nav-toggle"
                         onClick={() => setNavOpen((v) => !v)}
-                        aria-label="Notes"
+                        aria-label="Navigation"
                         aria-expanded={navOpen}
                     >
                         ☰
                     </button>
-                    <span className="doc-title">{showFiles ? "Files" : activeTitle ?? "—"}</span>
-                    {active && !showFiles && (
+                    {/* The crumb is the navigation, not a label: every segment
+                        goes somewhere. It now starts one level higher than the
+                        namespace, because the namespace list is a real place. */}
+                    <nav className="crumbs" aria-label="Breadcrumb">
+                        <button
+                            className={`crumb root${home === "root" ? " here" : ""}`}
+                            onClick={() => setHome("root")}
+                            title="Every collection you track"
+                        >
+                            collections
+                        </button>
+                        {repo && (
+                            <span className="crumb-seg">
+                                <span className="crumb-sep" aria-hidden="true">/</span>
+                                <button
+                                    className={`crumb coll${home === "space" ? " here" : ""}`}
+                                    onClick={() => setHome("space")}
+                                    title={`Every document in ${repo.namespace}`}
+                                >
+                                    {repo.namespace}
+                                </button>
+                            </span>
+                        )}
+                        {!home && crumbs.map((p, n) => (
+                            <span key={p} className="crumb-seg">
+                                <span className="crumb-sep" aria-hidden="true">/</span>
+                                <button
+                                    className={`crumb${n === crumbs.length - 1 ? " here" : ""}`}
+                                    onClick={() => openNote(p)}
+                                    title={p}
+                                >
+                                    {titleOf(p)}
+                                </button>
+                            </span>
+                        ))}
+                    </nav>
+                    <span className="spacer" />
+                    {active && !home && (
                         <div className="view-switch" role="group" aria-label="View">
                             {["edit", "split", "read"].map((m) => (
                                 <button
@@ -1124,60 +1515,67 @@ export default function App({ address, onLogout }) {
                     )}
                     {/* Public notes live in the shared room — the server persists
                         them, so there's no local save state to report. */}
-                    {repo?.visibility !== "public" && (
+                    {repo?.visibility !== "public" && !home && (
                         <span className={`save-state ${saveState}`}>{saveState}</span>
                     )}
-                    <span className="spacer" />
-                    <button
-                        className={`btn${showFiles ? " primary" : ""}`}
-                        onClick={() => setShowFiles((v) => !v)}
-                        aria-pressed={showFiles}
-                        title="All files — bulk select, rename, delete"
-                    >
-                        🗂 Files
-                    </button>
-                    {active && !showFiles && (
-                        <>
-                            <button
-                                className="btn"
-                                onClick={() => download(`${(activeTitle ?? active).replace(/[/\\?%*:|"<>]/g, "-")}.html`, exportDoc(), "text/html")}
-                                title="Download this note as a standalone HTML document"
-                            >
-                                ⤓ HTML
-                            </button>
-                            <button className="btn" onClick={() => printDocument(exportDoc())} title="Print (or save as PDF)">
-                                🖨
-                            </button>
-                        </>
-                    )}
-                    {repo && repo.visibility !== "private" && (
-                        <button className="btn share" onClick={shareLink} title="Copy a link — anyone can paste it to subscribe to this namespace">
-                            🔗 Share
-                        </button>
-                    )}
-                    {repo?.isOwner && repo.visibility !== "private" && (
-                        <button
-                            className="btn"
-                            onClick={() => setShowCollabs((v) => !v)}
-                            title="Choose who can co-edit this namespace"
-                        >
-                            👥 {repo.collaborators?.length ?? 0}
-                        </button>
-                    )}
                     {repo?.isOwner && (
                         <button
-                            className="btn"
-                            onClick={() => setShowAgents((v) => !v)}
-                            title="Mint a token so an agent can read and write this namespace"
+                            className={`btn primary publish${pending > 0 ? " pending" : ""}`}
+                            onClick={publish}
+                            disabled={status?.kind === "busy"}
+                            title={
+                                !repo.head
+                                    ? `“${repo.namespace}” has never been published — this settles all ${notes.length} note(s) on-chain`
+                                    : pending > 0
+                                        ? `${pending} note(s) in “${repo.namespace}” changed since the last publish`
+                                        : `“${repo.namespace}” matches its published head — nothing to settle`
+                            }
                         >
-                            🤖
+                            <span className="publish-verb">Publish</span>
+                            <span className="publish-ns">{repo.namespace}</span>
+                            {pending > 0 && <span className="publish-dot" aria-hidden="true" />}
                         </button>
                     )}
-                    {repo?.isOwner && (
-                        <button className="btn primary" onClick={publish} disabled={status?.kind === "busy"}>
-                            Publish
-                        </button>
-                    )}
+                    {/* Everything that isn't "where am I" or "publish" lives
+                        behind one control, so the bar fits a phone without
+                        wrapping into three rows of buttons. */}
+                    <Popover label="⋯" title="More actions" className="more-pop" panelClass="more-panel">
+                        {(close) => (
+                            <>
+                                {repo && repo.visibility !== "private" && (
+                                    <button className="menu-item" onClick={() => { shareLink(); close(); }}>
+                                        🔗 Copy share link
+                                    </button>
+                                )}
+                                {active && !home && (
+                                    <>
+                                        <button
+                                            className="menu-item"
+                                            onClick={() => { download(`${(activeTitle ?? active).replace(/[/\\?%*:|"<>]/g, "-")}.html`, exportDoc(), "text/html"); close(); }}
+                                        >
+                                            ⤓ Download as HTML
+                                        </button>
+                                        <button className="menu-item" onClick={() => { printDocument(exportDoc()); close(); }}>
+                                            🖨 Print or save as PDF
+                                        </button>
+                                    </>
+                                )}
+                                {repo?.isOwner && repo.visibility !== "private" && (
+                                    <button className="menu-item" onClick={() => { setShowCollabs((v) => !v); close(); }}>
+                                        👥 Collaborators ({repo.collaborators?.length ?? 0})
+                                    </button>
+                                )}
+                                {repo?.isOwner && (
+                                    <button className="menu-item" onClick={() => { setShowAgents((v) => !v); close(); }}>
+                                        🤖 Agent tokens
+                                    </button>
+                                )}
+                                <button className="menu-item" onClick={() => { pull(); close(); }}>
+                                    ↓ Pull from the network
+                                </button>
+                            </>
+                        )}
+                    </Popover>
                 </header>
                 {showAgents && repo?.isOwner && (
                     <AgentPanel
@@ -1206,8 +1604,17 @@ export default function App({ address, onLogout }) {
                         <button className="btn ghost" onClick={() => setStatus(null)}>×</button>
                     </div>
                 )}
-                {showFiles ? (
-                    <FilesView
+                {home === "root" ? (
+                    <CollectionList
+                        repos={repos}
+                        active={repo?.namespace}
+                        nudges={nudges}
+                        address={address}
+                        onOpen={(ns) => { switchRepo(ns); setHome("space"); }}
+                        onDelete={deleteRepo}
+                    />
+                ) : home ? (
+                    <CollectionHome
                         // Paths are per-namespace: `index.md` exists in most of
                         // them, so a pick carried across a switch would delete
                         // the wrong file. Remounting drops the selection.
@@ -1216,10 +1623,13 @@ export default function App({ address, onLogout }) {
                         tree={tree}
                         active={active}
                         writable={!!repo?.writable}
-                        onOpen={(path) => { setShowFiles(false); openNote(path); }}
+                        repo={repo}
+                        onPull={pull}
+                        onOpen={openNote}
+                        onMove={moveNote}
                         onRename={renameNoteAt}
                         onDelete={deleteNotes}
-                        onClose={() => setShowFiles(false)}
+                        onNew={newNote}
                     />
                 ) : active ? (
                     <>
@@ -1266,9 +1676,26 @@ export default function App({ address, onLogout }) {
                         )}
                     </>
                 ) : (
-                    <div className="empty">No notes yet — create one, or Pull if this is a subscribed namespace.</div>
+                    <div className="empty">
+                        <p>Nothing open.</p>
+                        <div className="empty-acts">
+                            <button className="btn" onClick={() => setHome("space")}>Browse this namespace</button>
+                            {repo?.writable && <button className="btn primary" onClick={() => newNote()}>Write a document</button>}
+                        </div>
+                    </div>
                 )}
             </main>
+
+            {jump && (
+                <JumpPalette
+                    notes={notes}
+                    repos={repos}
+                    activeNs={repo?.namespace}
+                    onOpen={openNote}
+                    onSwitch={switchRepo}
+                    onClose={() => setJump(false)}
+                />
+            )}
         </div>
     );
 }

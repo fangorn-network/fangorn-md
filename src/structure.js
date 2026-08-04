@@ -21,6 +21,36 @@ export function flattenTree(tree, depth = 0) {
     return tree.flatMap((n) => [{ path: n.path, depth }, ...flattenTree(n.children, depth + 1)]);
 }
 
+/** How many notes hang below `node`. A collapsed row says what it's hiding. */
+export const subtreeCount = (node) =>
+    node.children.reduce((n, c) => n + 1 + subtreeCount(c), 0);
+
+/**
+ * The chain of paths from a root down to `path`, excluding `path` itself, or
+ * null if it isn't in the tree. Two jobs: the breadcrumb, and knowing which
+ * rows to auto-expand and mark as lineage when a note opens.
+ */
+export function ancestorsOf(nodes, path, trail = []) {
+    for (const n of nodes) {
+        if (n.path === path) return trail;
+        const hit = ancestorsOf(n.children, path, [...trail, n.path]);
+        if (hit) return hit;
+    }
+    return null;
+}
+
+/**
+ * Depth-first walk that stops at any node not in `open` — the Home view's row
+ * order once folding exists. Same shape as flattenTree, plus what a row needs
+ * to draw itself: whether it has children, and how many.
+ */
+export function foldTree(tree, open, depth = 0) {
+    return tree.flatMap((n) => {
+        const row = { path: n.path, depth, count: subtreeCount(n), open: open.has(n.path) };
+        return row.count > 0 && row.open ? [row, ...foldTree(n.children, open, depth + 1)] : [row];
+    });
+}
+
 /**
  * The paths between two rows, inclusive, in whatever order they're displayed —
  * shift-click. Either endpoint missing (a filtered-away anchor) yields just the

@@ -204,7 +204,13 @@ function userStore(address) {
         activeOrNull() { const s = read(); return s.active ? resolve(s.repos[s.active]) : null; },
         active() { const r = this.activeOrNull(); if (!r) throw new HttpError(404, "no active repo — create one first"); return r; },
         setActive(ns) { const s = read(); if (!s.repos[ns]) throw new HttpError(404, `no such repo: ${ns}`); s.active = ns; write(s); },
-        setHead(ns, cid) { const s = read(); s.repos[ns].head = cid; write(s); },
+        // `syncedAt` is when this working tree last agreed with the head — set by
+        // both settle (we published it) and pull (we fetched it). Notes touched
+        // after it are the unpublished ones, which is what the Publish button
+        // reports. mtime-based, so it's a hint and not a proof: an editor that
+        // rewrites a file with identical bytes counts as a change.
+        setHead(ns, cid) { const s = read(); s.repos[ns].head = cid; s.repos[ns].syncedAt = Date.now(); write(s); },
+        markSynced(ns) { const s = read(); if (s.repos[ns]) { s.repos[ns].syncedAt = Date.now(); write(s); } },
         add(repo) {
             const s = read();
             s.repos[repo.namespace] = repo;
@@ -779,7 +785,12 @@ const routes = {
         // head — a namespace tracked by discover, or followed, has one already —
         // and a stale `null` reads as "never published" everywhere it's used.
         if (tip && tip !== repo.head) userStore(address).setHead(repo.namespace, tip);
-        return pullRepo(repo, latest);
+        const pulled = pullRepo(repo, latest);
+        // The tree now matches the head, so nothing is pending — without this a
+        // pull leaves every file it just wrote looking locally-modified, because
+        // writing them is what gave them a fresh mtime.
+        if (tip) userStore(address).markSynced(repo.namespace);
+        return pulled;
     },
 
     // Stop tracking a namespace, and delete its working tree if it's yours.
