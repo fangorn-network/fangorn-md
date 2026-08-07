@@ -632,7 +632,7 @@ function JumpPalette({ notes, repos, activeNs, onOpen, onSwitch, onClose }) {
             <div className="jump" onClick={(e) => e.stopPropagation()}>
                 <input
                     className="jump-input"
-                    placeholder="Search every collection — names and text…"
+                    placeholder="Search all collections"
                     value={q}
                     onChange={(e) => { setQ(e.target.value); setI(0); }}
                     onKeyDown={onKeyDown}
@@ -997,6 +997,13 @@ export default function App({ address, onLogout }) {
     const [home, setHome] = useState(false);
     const [jump, setJump] = useState(false);
     const [collForm, setCollForm] = useState(null); // "new" | "follow" | null — see CollectionList
+    // Search hides while you scroll INTO a document and comes back the moment
+    // you head back up. Only ever true on a phone (the collapse rule lives in a
+    // media query); the flag is set unconditionally because it costs nothing and
+    // a matchMedia listener up here would be a second source of truth for a
+    // breakpoint the stylesheet already owns.
+    const [scrollingDown, setScrollingDown] = useState(false);
+    const lastScrollY = useRef(0);
     // An incoming share link (?owner=&ns=&note=) — parsed once on mount.
     const [share, setShare] = useState(() => {
         const p = new URLSearchParams(window.location.search);
@@ -1098,6 +1105,21 @@ export default function App({ address, onLogout }) {
             window.removeEventListener("error", onErr);
             window.removeEventListener("unhandledrejection", onErr);
         };
+    }, []);
+
+    // Which way the pane is scrolling, for the search bar. The editor, the
+    // rendered pane and the two browsing lists are four separate scroll
+    // containers and scroll does NOT bubble, so this is one capture-phase
+    // listener on the document rather than a handler wired into each of them.
+    useEffect(() => {
+        const onScroll = (e) => {
+            const y = e.target?.scrollTop ?? 0;
+            // Past 48px, so the bar can't flicker on the rubber-band at the top.
+            setScrollingDown(y > 48 && y > lastScrollY.current);
+            lastScrollY.current = y;
+        };
+        document.addEventListener("scroll", onScroll, true);
+        return () => document.removeEventListener("scroll", onScroll, true);
     }, []);
 
     // ⌘K / Ctrl-K from anywhere, including with the caret inside the editor —
@@ -1472,11 +1494,6 @@ export default function App({ address, onLogout }) {
                     )}
                 </Popover>
 
-                <button className="jump-open" onClick={() => setJump(true)}>
-                    <span>⌕ Jump to anything</span>
-                    <kbd>⌘K</kbd>
-                </button>
-
                 <nav className="rail">
                     {/* Not "All notes": this shows ONE namespace, and a label that
                         implied every namespace is why `second brain` looked missing. */}
@@ -1529,7 +1546,18 @@ export default function App({ address, onLogout }) {
             </aside>
             {navOpen && <div className="nav-backdrop" onClick={() => setNavOpen(false)} />}
 
-            <main className="main">
+            <main className={`main${scrollingDown ? " scrolled-down" : ""}`}>
+                {/* Search, at full width, in every view — it was a 13px box at
+                    the bottom of a drawer, which on a phone made the fastest
+                    path to anything the hardest one to find. A button dressed as
+                    a field: the real input is the palette's, and two inputs that
+                    both look like search but only one of which searches
+                    everything is worse than one that clearly opens the other. */}
+                <button className="search-bar" onClick={() => setJump(true)}>
+                    <span className="search-glyph" aria-hidden="true">⌕</span>
+                    <span className="search-hint">Search all collections…</span>
+                    <kbd>⌘K</kbd>
+                </button>
                 {share && (
                     <div className="banner">
                         🔗 A namespace was shared with you — <b>{share.ns}</b> by {short(share.owner)}
@@ -1840,61 +1868,79 @@ export default function App({ address, onLogout }) {
                     </div>
                 )}
 
-                {/* ── Thumb bar ────────────────────────────────
-                    Phone only (styles.css hides it above 720px, and hides the
-                    top bar's copies of these actions below it). Every action
-                    here already exists at the top of the view; what it buys is
-                    reach — the top of a 6" screen is a two-handed stretch and
-                    these are the things you do most.
-
-                    A flex child of <main>, not a fixed overlay: it takes its own
-                    row, so nothing hides under it and the software keyboard
-                    pushes it off rather than floating it over the caret. It's
-                    absent while a document is open — that view's actions are
-                    formatting and Done, which live with the editor, and a bar
-                    under a keyboard is the one place a thumb can't reach. */}
-                {home && (
-                    <nav className="thumbbar" aria-label="Actions">
-                        <button className="thumb-act" onClick={() => setJump(true)}>
-                            <span className="thumb-glyph" aria-hidden="true">⌕</span>Search
-                        </button>
-                        {home === "root" ? (
-                            <>
-                                <button
-                                    className={`thumb-act${collForm === "follow" ? " on" : ""}`}
-                                    aria-expanded={collForm === "follow"}
-                                    onClick={() => setCollForm((f) => (f === "follow" ? null : "follow"))}
-                                >
-                                    <span className="thumb-glyph" aria-hidden="true">⇩</span>Subscribe
-                                </button>
-                                <button
-                                    className={`thumb-act primary${collForm === "new" ? " on" : ""}`}
-                                    aria-expanded={collForm === "new"}
-                                    onClick={() => setCollForm((f) => (f === "new" ? null : "new"))}
-                                >
-                                    <span className="thumb-glyph" aria-hidden="true">＋</span>Collection
-                                </button>
-                            </>
-                        ) : (
-                            <>
-                                <button className="thumb-act" onClick={() => setHome("root")}>
-                                    <span className="thumb-glyph" aria-hidden="true">⌂</span>Collections
-                                </button>
-                                {active && (
-                                    <button className="thumb-act" onClick={() => setHome(false)}>
-                                        <span className="thumb-glyph" aria-hidden="true">✎</span>Resume
-                                    </button>
-                                )}
-                                {repo?.writable && (
-                                    <button className="thumb-act primary" onClick={() => newNote()}>
-                                        <span className="thumb-glyph" aria-hidden="true">＋</span>Document
-                                    </button>
-                                )}
-                            </>
-                        )}
-                    </nav>
-                )}
             </main>
+
+            {/* ── Thumb bar ────────────────────────────────────────
+                Phone only (styles.css hides it above 720px, and hides the top
+                bar's copies of these actions below it). Every action here
+                already exists at the top of the view; what it buys is reach —
+                the top of a 6" screen is a two-handed stretch and these are the
+                things you do most.
+
+                A sibling of <main> rather than a child of it, and the app turns
+                into a column at the same breakpoint: the bar is then the last
+                row of a 100dvh box, so it can't be scrolled away without being
+                `position: fixed` — nothing overlaps it, no scroll container
+                needs bottom padding to clear it, and the software keyboard
+                pushes it up on Android rather than floating it over the caret.
+
+                It stays up while a document is open. `＋` and `⌕` are the two
+                things you reach for from inside a note as often as from the
+                list, and Done at the bottom-right is a shorter trip than Done in
+                the top-right corner (the topbar's copy is hidden on phones). */}
+            <nav className="thumbbar" aria-label="Actions">
+                <button className="thumb-act" onClick={() => setJump(true)}>
+                    <span className="thumb-glyph" aria-hidden="true">⌕</span>Search
+                </button>
+                {home === "root" ? (
+                    <>
+                        <button
+                            className={`thumb-act${collForm === "follow" ? " on" : ""}`}
+                            aria-expanded={collForm === "follow"}
+                            onClick={() => setCollForm((f) => (f === "follow" ? null : "follow"))}
+                        >
+                            <span className="thumb-glyph" aria-hidden="true">⇩</span>Subscribe
+                        </button>
+                        <button
+                            className={`thumb-act primary${collForm === "new" ? " on" : ""}`}
+                            aria-expanded={collForm === "new"}
+                            onClick={() => setCollForm((f) => (f === "new" ? null : "new"))}
+                        >
+                            <span className="thumb-glyph" aria-hidden="true">＋</span>Collection
+                        </button>
+                    </>
+                ) : home ? (
+                    <>
+                        <button className="thumb-act" onClick={() => setHome("root")}>
+                            <span className="thumb-glyph" aria-hidden="true">⌂</span>Collections
+                        </button>
+                        {active && (
+                            <button className="thumb-act" onClick={() => setHome(false)}>
+                                <span className="thumb-glyph" aria-hidden="true">✎</span>Resume
+                            </button>
+                        )}
+                        {repo?.writable && (
+                            <button className="thumb-act primary" onClick={() => newNote()}>
+                                <span className="thumb-glyph" aria-hidden="true">＋</span>Document
+                            </button>
+                        )}
+                    </>
+                ) : (
+                    <>
+                        {/* Same move as the topbar's ✓, in the corner a thumb
+                            already rests in. It says Done, not Save: the text is
+                            saved as you type and promising otherwise would lie. */}
+                        <button className="thumb-act" onClick={() => setHome("space")}>
+                            <span className="thumb-glyph" aria-hidden="true">✓</span>Done
+                        </button>
+                        {repo?.writable && (
+                            <button className="thumb-act primary" onClick={() => newNote()}>
+                                <span className="thumb-glyph" aria-hidden="true">＋</span>Document
+                            </button>
+                        )}
+                    </>
+                )}
+            </nav>
 
             {jump && (
                 <JumpPalette

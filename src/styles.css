@@ -97,23 +97,8 @@ body {
 }
 .pop-caret { color: var(--mist-dim); font-size: 10px; }
 
-.jump-open {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 10px 10px 4px;
-    padding: 7px 10px;
-    border: 1px solid var(--edge);
-    border-radius: var(--radius-sm);
-    background: var(--night);
-    color: var(--mist-dim);
-    font: 13px var(--face-ui);
-    cursor: pointer;
-    text-align: left;
-}
-.jump-open:hover { border-color: var(--mist-dim); color: var(--mist); }
-.jump-open span { flex: 1; }
-.jump-open kbd, .jump kbd {
+/* Search moved out of the sidebar and into the main pane — see .search-bar. */
+.jump kbd {
     font: 11px var(--face-data);
     color: var(--mist-dim);
     border: 1px solid var(--edge);
@@ -294,6 +279,29 @@ body {
     border-bottom: 1px solid var(--edge);
     background: var(--shade);
 }
+/* ── Search ──────────────────────────────────────────────
+   Under the topbar in every view, at the full width of the pane, because it is
+   the shortest route to any document in any collection and it used to be a
+   13px box at the bottom of a drawer. A button, not an input: it opens the
+   palette, whose field is the one that actually searches. */
+.search-bar {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    padding: 10px 16px;
+    border: 0;
+    border-bottom: 1px solid var(--edge);
+    background: var(--night);
+    color: var(--mist-dim);
+    font: 13.5px var(--face-ui);
+    text-align: left;
+    cursor: pointer;
+}
+.search-bar:hover { background: var(--under); color: var(--mist); }
+.search-glyph { font-size: 15px; color: var(--bloom); }
+.search-hint { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* ── Breadcrumb ──────────────────────────────────────────
    Replaces a bare title. In a folded tree the title alone tells you nothing
    about which branch you're on, and every segment here is a way back up. */
@@ -1110,6 +1118,12 @@ body {
    full-screen palette, so the drawer is only for switching collections — a thing you
    do rarely. That's the fix; the rules below are just fit. */
 @media (max-width: 720px) {
+    /* The app becomes a column so the thumb bar can be its last row — see the
+       .thumbbar rules below. The sidebar is taken out of flow just underneath,
+       so it doesn't become a row of this column. */
+    .app { flex-direction: column; }
+    .main { min-height: 0; } /* a column's flex child won't scroll internally without it */
+
     .sidebar {
         position: fixed;
         top: 0;
@@ -1240,11 +1254,38 @@ body {
     }
     .thumb-act.primary.on { background: var(--bloom-deep); border-color: var(--bloom-deep); color: var(--mist); }
 
-    /* The top bar's copies of exactly these actions. One set per screen. */
-    .home-bar > .btn { display: none; }
-    /* The list scrolls under its own bar now, so the old runway for a
-       floating-nothing is just dead space above a real one. */
-    .home-list { padding-bottom: 12vh; }
+    /* The top bar's copies of exactly these actions. One set per screen —
+       ✓ Done included, which the thumb bar now carries in the corner a thumb
+       is already resting in. */
+    .home-bar > .btn, .done-edit { display: none; }
+    /* Nothing scrolls under the bar any more, so the list no longer needs a
+       runway of empty rows to be reachable past a floating control. */
+    .home-list { padding-bottom: 6vh; }
+
+    /* ── Search, out of the way while you read ──────────
+       Scrolling down through a document means you're reading it, and 44px of
+       chrome you aren't using is 44px of the document you can't see. Scrolling
+       back up — or reaching the top — is the gesture that means "get me out of
+       here", so that's when it returns. Collapsing rather than translating
+       keeps it in flow: the text under it moves once, not twice. */
+    .search-bar {
+        font-size: 15px;
+        padding: 12px 14px;
+        /* Any value at or above the bar's real height; it only has to be a
+           finite number for the transition to have somewhere to go. */
+        max-height: 56px;
+        overflow: hidden;
+        transition: max-height 0.18s ease, padding 0.18s ease, opacity 0.14s ease;
+    }
+    .main.scrolled-down .search-bar {
+        max-height: 0;
+        padding-top: 0;
+        padding-bottom: 0;
+        opacity: 0;
+        border-bottom-width: 0;
+    }
+    /* No ⌘K on a phone. */
+    .search-bar kbd { display: none; }
 }
 
 /* The date and the tally are the first things to go — depth and name are what
@@ -1289,4 +1330,5 @@ body {
 @media (prefers-reduced-motion: reduce) {
     .sidebar { transition: none; }
     .btn { transition: none; }
+    .search-bar { transition: none; }
 }
