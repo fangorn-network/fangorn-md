@@ -359,7 +359,10 @@ function CollectionHome({ notes, tree, active, writable, repo, onPull, onOpen, o
 // breadcrumb, the row shape and the click target all keep meaning what they
 // meant. Counts are absent on purpose: only the open collection's documents are
 // loaded, and a made-up number is worse than none.
-function CollectionList({ repos, active, nudges, address, onOpen, onDelete }) {
+// `form` ("new" | "follow" | null) lives in App, not here: the thumb bar at the
+// bottom of the screen opens the same two forms, and on a phone that bar is the
+// only copy of these actions you can reach.
+function CollectionList({ repos, active, nudges, address, form, setForm, onOpen, onDelete, onCreate, onFollow }) {
     const [query, setQuery] = useState("");
     const q = query.trim().toLowerCase();
     const rows = repos.filter((r) => !q || r.namespace.toLowerCase().includes(q));
@@ -377,26 +380,68 @@ function CollectionList({ repos, active, nudges, address, onOpen, onDelete }) {
                 <span className="home-tally">
                     {repos.length} collection{repos.length === 1 ? "" : "s"}
                 </span>
+                <button
+                    className="btn ghost small"
+                    aria-expanded={form === "follow"}
+                    onClick={() => setForm(form === "follow" ? null : "follow")}
+                >
+                    Subscribe
+                </button>
+                <button
+                    className="btn small"
+                    aria-expanded={form === "new"}
+                    onClick={() => setForm(form === "new" ? null : "new")}
+                >
+                    New collection
+                </button>
             </div>
+            {/* Inline rather than in a popover: choosing public or private can't
+                be undone, and that warning should sit in the page you're
+                looking at, at full width, not in a 260px panel that closes if
+                you click past it. */}
+            {form && (
+                <div className="home-form">
+                    {form === "new"
+                        ? <NewCollectionForm onCreate={onCreate} done={() => setForm(null)} />
+                        : <SubscribeForm onFollow={onFollow} done={() => setForm(null)} />}
+                </div>
+            )}
             <div className="home-list">
                 {rows.map((r) => (
                     <div key={r.namespace} className={`home-row coll-row${r.namespace === active ? " active" : ""}`}>
-                        <button className="home-title coll-title" onClick={() => onOpen(r.namespace)} title={`Open ${r.namespace}`}>
-                            {r.namespace}
-                        </button>
-                        {nudges?.[r.namespace] && r.namespace !== active && (
-                            <span className="repo-dot" title="updated on-chain since you last looked" />
-                        )}
-                        {/* Three facts that change what this collection IS, so
-                            they're words rather than icons you have to learn. */}
-                        <span className={`coll-tag ${r.visibility}`}>
-                            {r.visibility === "private" ? "private" : "public"}
-                        </span>
-                        <span className="coll-tag">
-                            {r.owner === address ? "owner" : r.writable ? "collaborator" : "read-only"}
-                        </span>
-                        <span className="coll-head" title={r.head ?? "nothing settled on-chain yet"}>
-                            {r.head ? short(r.head) : "unpublished"}
+                        {/* Name and facts share a wrapper so a phone can stack
+                            them. Flat, they competed for one line and the name
+                            — the only part you navigate by — was the part that
+                            truncated. */}
+                        <span className="coll-main">
+                            <button className="home-title coll-title" onClick={() => onOpen(r.namespace)} title={`Open ${r.namespace}`}>
+                                {r.namespace}
+                            </button>
+                            {nudges?.[r.namespace] && r.namespace !== active && (
+                                <span className="repo-dot" title="updated on-chain since you last looked" />
+                            )}
+                            {/* Three facts that change what this collection IS, so
+                                they're words rather than icons you have to learn. */}
+                            <span className="coll-facts">
+                                <span className={`coll-tag ${r.visibility}`}>
+                                    {r.visibility === "private" ? "private" : "public"}
+                                </span>
+                                <span className="coll-tag">
+                                    {r.owner === address ? "owner" : r.writable ? "collaborator" : "read-only"}
+                                </span>
+                                {/* Whether it exists off this disk, in the same
+                                    ●/◦ the switcher and the footer already use.
+                                    The truncated CID that used to sit here was
+                                    the widest thing in the row and the least
+                                    readable — it's in the tooltip, whole. */}
+                                <span
+                                    className={`coll-head${r.head ? " on" : ""}`}
+                                    title={r.head ? `published on-chain — head ${r.head}` : "nothing settled on-chain yet"}
+                                >
+                                    <span aria-hidden="true">{r.head ? "●" : "◦"}</span>
+                                    {r.head ? "published" : "unpublished"}
+                                </span>
+                            </span>
                         </span>
                         <span className="tree-actions">
                             <button
@@ -409,9 +454,20 @@ function CollectionList({ repos, active, nudges, address, onOpen, onDelete }) {
                         </span>
                     </div>
                 ))}
+                {/* An empty account is the one screen every new person sees,
+                    and it used to be a full stop. It's the only place the two
+                    ways in can be explained at length, so it does that. */}
                 {rows.length === 0 && (
                     <div className="home-empty">
-                        {query ? <>No collection matches “{query}”.</> : <>No collections yet.</>}
+                        {query ? <>No collection matches “{query}”.</> : (
+                            <div className="home-start">
+                                <p>A collection is a set of documents you publish together, under one name.</p>
+                                <p className="home-start-sub">
+                                    Start one of your own, or subscribe to someone else's with a share link.
+                                </p>
+                                <button className="btn primary" onClick={() => setForm("new")}>New collection</button>
+                            </div>
+                        )}
                     </div>
                 )}
             </div>
@@ -517,21 +573,51 @@ function JumpPalette({ notes, repos, activeNs, onOpen, onSwitch, onClose }) {
     const [q, setQ] = useState("");
     const [i, setI] = useState(0);
 
+    // Full-text results from the server, every collection included. Kept apart
+    // from the local list so the palette stays instant: names rank with zero
+    // latency, bodies arrive a moment later underneath.
+    const [found, setFound] = useState([]);
+    useEffect(() => {
+        const s = q.trim();
+        if (s.length < 2) { setFound([]); return; }
+        let live = true;
+        const t = setTimeout(
+            () => api.search(s).then((r) => live && setFound(r.hits)).catch(() => live && setFound([])),
+            180, // a keystroke is ~120ms apart; this searches the pause, not the typing
+        );
+        return () => { live = false; clearTimeout(t); };
+    }, [q]);
+
     const hits = useMemo(() => {
         const s = q.trim().toLowerCase();
-        const found = [
+        const local = [
             ...notes.map((n) => ({ kind: "note", id: n.path, label: n.title, hint: n.path, score: rank(s, n.title, n.path) })),
             ...repos
                 .filter((r) => r.namespace !== activeNs)
                 .map((r) => ({ kind: "coll", id: r.namespace, label: r.namespace, hint: "switch collection", score: rank(s, r.namespace, r.namespace) })),
-        ];
-        return found.filter((h) => h.score >= 0).sort((a, b) => a.score - b.score).slice(0, 12);
-    }, [q, notes, repos, activeNs]);
+        ].filter((h) => h.score >= 0).sort((a, b) => a.score - b.score);
 
-    const choose = (hit) => {
+        // A note already listed by name doesn't earn a second row for also
+        // containing the word.
+        const seen = new Set(local.map((h) => `${activeNs}:${h.id}`));
+        const text = found
+            .filter((h) => h.snippet && !seen.has(`${h.namespace}:${h.path}`))
+            .map((h) => ({
+                kind: "text", id: `${h.namespace}:${h.path}`, ns: h.namespace, path: h.path,
+                label: h.title, hint: h.snippet,
+            }));
+        return [...local.slice(0, 8), ...text.slice(0, 12)];
+    }, [q, notes, repos, activeNs, found]);
+
+    const choose = async (hit) => {
         if (!hit) return;
         onClose();
-        hit.kind === "coll" ? onSwitch(hit.id) : onOpen(hit.id);
+        if (hit.kind === "coll") return onSwitch(hit.id);
+        if (hit.kind === "note") return onOpen(hit.id);
+        // A text hit can live in a collection that isn't open. Switch first —
+        // openNote reads through the server's active pointer.
+        if (hit.ns !== activeNs) await onSwitch(hit.ns);
+        onOpen(hit.path);
     };
 
     const onKeyDown = (e) => {
@@ -546,7 +632,7 @@ function JumpPalette({ notes, repos, activeNs, onOpen, onSwitch, onClose }) {
             <div className="jump" onClick={(e) => e.stopPropagation()}>
                 <input
                     className="jump-input"
-                    placeholder="Jump to a document or a collection…"
+                    placeholder="Search every collection — names and text…"
                     value={q}
                     onChange={(e) => { setQ(e.target.value); setI(0); }}
                     onKeyDown={onKeyDown}
@@ -562,14 +648,77 @@ function JumpPalette({ notes, repos, activeNs, onOpen, onSwitch, onClose }) {
                             >
                                 <span className={`jump-kind ${h.kind}`}>{h.kind === "coll" ? "set" : "doc"}</span>
                                 <span className="jump-label">{h.label}</span>
-                                <span className="jump-hint">{h.hint}</span>
+                                {/* A snippet reads left-to-right; the right-aligned
+                                    hint is for short facts like a path. */}
+                                <span className={`jump-hint${h.kind === "text" ? " snip" : ""}`}>
+                                    {h.kind === "text" && h.ns !== activeNs && <em>{h.ns} · </em>}
+                                    {h.hint}
+                                </span>
                             </button>
                         </li>
                     ))}
-                    {hits.length === 0 && <li className="home-empty">No document or collection matches “{q}”.</li>}
+                    {hits.length === 0 && <li className="home-empty">Nothing matches “{q}”.</li>}
                 </ul>
             </div>
         </div>
+    );
+}
+
+// The two ways a collection reaches your sidebar. They live out here because
+// there are two places you can reach for them — the collections view, where you
+// go to start one, and the switcher, where you land when you're already writing
+// — and the visibility warning has to read identically in both. Two call sites
+// for the same irreversible choice is exactly the thing you don't want to
+// maintain in two copies.
+function NewCollectionForm({ onCreate, done }) {
+    const [name, setName] = useState("");
+    const [visibility, setVisibility] = useState("public");
+    return (
+        <form
+            className="repo-form"
+            onSubmit={(e) => {
+                e.preventDefault();
+                if (!name.trim()) return;
+                onCreate(name.trim(), visibility);
+                setName(""); setVisibility("public"); done();
+            }}
+        >
+            <input className="repo-input" placeholder="Name it (e.g. My Recipes)" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+            <label className="repo-field">
+                <span className="repo-bar-label">who can read it</span>
+                <select className="repo-input" value={visibility} onChange={(e) => setVisibility(e.target.value)}>
+                    <option value="public">Public — anyone can read</option>
+                    <option value="private">Private — encrypted</option>
+                </select>
+            </label>
+            {/* Visibility is fixed at creation and decides whether the network
+                ever sees plaintext, so it says so up front rather than in a doc
+                nobody opens. */}
+            <p className="repo-hint">
+                {visibility === "private"
+                    ? "Notes are sealed with a key derived from your wallet. The server pins ciphertext it cannot read. This can't be changed later."
+                    : "Notes publish as plaintext anyone can read and verify. This can't be changed later."}
+            </p>
+            <button className="btn small primary" type="submit">Create collection</button>
+        </form>
+    );
+}
+
+function SubscribeForm({ onFollow, done }) {
+    const [ref, setRef] = useState("");
+    return (
+        <form
+            className="repo-form"
+            onSubmit={(e) => {
+                e.preventDefault();
+                if (!ref.trim()) return;
+                onFollow(ref.trim());
+                setRef(""); done();
+            }}
+        >
+            <input className="repo-input" placeholder="Paste a share link, or owner/name" value={ref} onChange={(e) => setRef(e.target.value)} autoFocus />
+            <button className="btn small primary" type="submit">Subscribe</button>
+        </form>
     );
 }
 
@@ -579,22 +728,6 @@ function JumpPalette({ notes, repos, activeNs, onOpen, onSwitch, onClose }) {
 // neither one was navigable.
 function CollectionMenu({ repos, active, nudges, onSwitch, onCreate, onFollow, onDiscover, onDelete, close }) {
     const [form, setForm] = useState(null); // "new" | "follow" | null
-    const [name, setName] = useState("");
-    const [visibility, setVisibility] = useState("public");
-    const [ref, setRef] = useState("");
-
-    const submitNew = (e) => {
-        e.preventDefault();
-        if (!name.trim()) return;
-        onCreate(name.trim(), visibility);
-        setName(""); setVisibility("public"); setForm(null); close();
-    };
-    const submitFollow = (e) => {
-        e.preventDefault();
-        if (!ref.trim()) return;
-        onFollow(ref.trim());
-        setRef(""); setForm(null); close();
-    };
 
     return (
         <div className="repo-bar">
@@ -621,7 +754,7 @@ function CollectionMenu({ repos, active, nudges, onSwitch, onCreate, onFollow, o
                             {/* Whether anything was ever settled decides what a
                                 delete actually costs, so it's on the row. */}
                             <span className="repo-badge" title={r.head ? `published on-chain (head ${short(r.head)}) — deleting is local only` : "never published — local only, deleting is permanent"}>
-                                {r.head ? "⛓" : "◦"}
+                                {r.head ? "●" : "◦"}
                             </span>
                         </button>
                         <button
@@ -649,33 +782,8 @@ function CollectionMenu({ repos, active, nudges, onSwitch, onCreate, onFollow, o
                 </button>
             </div>
 
-            {form === "new" && (
-                <form className="repo-form" onSubmit={submitNew}>
-                    <input className="repo-input" placeholder="Name it (e.g. My Recipes)" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
-                    <label className="repo-field">
-                        <span className="repo-bar-label">who can read it</span>
-                        <select className="repo-input" value={visibility} onChange={(e) => setVisibility(e.target.value)}>
-                            <option value="public">Public — anyone can read</option>
-                            <option value="private">Private — encrypted</option>
-                        </select>
-                    </label>
-                    {/* Visibility is fixed at creation and decides whether the
-                        network ever sees plaintext, so it says so up front
-                        rather than in a doc nobody opens. */}
-                    <p className="repo-hint">
-                        {visibility === "private"
-                            ? "Notes are sealed with a key derived from your wallet. The server pins ciphertext it cannot read. This can't be changed later."
-                            : "Notes publish as plaintext anyone can read and verify. This can't be changed later."}
-                    </p>
-                    <button className="btn small primary" type="submit">Create collection</button>
-                </form>
-            )}
-            {form === "follow" && (
-                <form className="repo-form" onSubmit={submitFollow}>
-                    <input className="repo-input" placeholder="Paste a share link, or owner/name" value={ref} onChange={(e) => setRef(e.target.value)} autoFocus />
-                    <button className="btn small primary" type="submit">Subscribe</button>
-                </form>
-            )}
+            {form === "new" && <NewCollectionForm onCreate={onCreate} done={() => { setForm(null); close(); }} />}
+            {form === "follow" && <SubscribeForm onFollow={onFollow} done={() => { setForm(null); close(); }} />}
         </div>
     );
 }
@@ -888,6 +996,7 @@ export default function App({ address, onLogout }) {
     // so leaving home lands back on the same note, unedited).
     const [home, setHome] = useState(false);
     const [jump, setJump] = useState(false);
+    const [collForm, setCollForm] = useState(null); // "new" | "follow" | null — see CollectionList
     // An incoming share link (?owner=&ns=&note=) — parsed once on mount.
     const [share, setShare] = useState(() => {
         const p = new URLSearchParams(window.location.search);
@@ -1398,7 +1507,7 @@ export default function App({ address, onLogout }) {
                                 says so, because that's what decides whether any
                                 of this exists outside your disk. */}
                             <div className="repo-head" title={repo.head ?? "nothing published yet"}>
-                                {repo.head ? `⛓ ${short(repo.head)}` : "◦ unpublished"}
+                                {repo.head ? `● ${short(repo.head)}` : "◦ unpublished"}
                             </div>
                         </>
                     )}
@@ -1448,7 +1557,11 @@ export default function App({ address, onLogout }) {
                         <button className="btn ghost" onClick={() => setNudges((n) => { const c = { ...n }; delete c[repo.namespace]; return c; })}>Dismiss</button>
                     </div>
                 )}
-                <header className="topbar">
+                {/* `editing` marks the one state where this bar has more in it
+                    than a phone can hold — document controls on top of the
+                    collection's. The stylesheet uses it to shed the parts that
+                    have somewhere else to live. */}
+                <header className={`topbar${active && !home ? " editing" : ""}`}>
                     <button
                         className="btn ghost nav-toggle"
                         onClick={() => setNavOpen((v) => !v)}
@@ -1499,7 +1612,11 @@ export default function App({ address, onLogout }) {
                             {["edit", "split", "read"].map((m) => (
                                 <button
                                     key={m}
-                                    className={`view-btn ${view === m ? "active" : ""}`}
+                                    /* `split` is hidden on a phone: there's no room for two
+                                       panes, so it falls back to the source and does exactly
+                                       what `edit` does. Offering a mode that changes nothing
+                                       costs a third of the switch's width. */
+                                    className={`view-btn ${m} ${view === m ? "active" : ""}`}
                                     aria-pressed={view === m}
                                     onClick={() => setView(m)}
                                     title={
@@ -1513,12 +1630,34 @@ export default function App({ address, onLogout }) {
                             ))}
                         </div>
                     )}
+                    {/* Closing the document. Editing has no save step — the
+                        crumb above already goes back — but leaving by clicking
+                        the collection's name reads as navigation you happen to
+                        be doing, not as finishing. This is the same move with
+                        the intent on the label, and on a phone it's the one
+                        control that gets you out of the editor without opening
+                        the drawer. It says Done, not Save: the text is already
+                        saved and promising otherwise would be a lie. */}
+                    {active && !home && (
+                        <button
+                            className="btn small done-edit"
+                            onClick={() => setHome("space")}
+                            title={`Done — back to ${repo?.namespace ?? "the collection"}`}
+                        >
+                            <span aria-hidden="true">✓</span>
+                            <span className="done-word">Done</span>
+                        </button>
+                    )}
                     {/* Public notes live in the shared room — the server persists
                         them, so there's no local save state to report. */}
                     {repo?.visibility !== "public" && !home && (
                         <span className={`save-state ${saveState}`}>{saveState}</span>
                     )}
-                    {repo?.isOwner && (
+                    {/* Publish settles ONE collection. At the root you are
+                        looking at all of them, so a button naming whichever one
+                        happens to be active is acting on something off screen —
+                        and on a phone it was crowding out the only breadcrumb. */}
+                    {repo?.isOwner && home !== "root" && (
                         <button
                             className={`btn primary publish${pending > 0 ? " pending" : ""}`}
                             onClick={publish}
@@ -1573,6 +1712,18 @@ export default function App({ address, onLogout }) {
                                 <button className="menu-item" onClick={() => { pull(); close(); }}>
                                     ↓ Pull from the network
                                 </button>
+                                {/* Publish's home is the bar. On a phone with a
+                                    document open the bar has to give up 150px
+                                    or the breadcrumb collapses to nothing, and
+                                    this is the thing you're least likely to
+                                    reach for mid-sentence — it settles a
+                                    transaction. CSS shows this copy only in
+                                    that one case. */}
+                                {repo?.isOwner && (
+                                    <button className="menu-item publish-in-menu" onClick={() => { publish(); close(); }}>
+                                        ⛓ Publish {repo.namespace}
+                                    </button>
+                                )}
                             </>
                         )}
                     </Popover>
@@ -1610,8 +1761,12 @@ export default function App({ address, onLogout }) {
                         active={repo?.namespace}
                         nudges={nudges}
                         address={address}
+                        form={collForm}
+                        setForm={setCollForm}
                         onOpen={(ns) => { switchRepo(ns); setHome("space"); }}
                         onDelete={deleteRepo}
+                        onCreate={createRepo}
+                        onFollow={followRepo}
                     />
                 ) : home ? (
                     <CollectionHome
@@ -1683,6 +1838,61 @@ export default function App({ address, onLogout }) {
                             {repo?.writable && <button className="btn primary" onClick={() => newNote()}>Write a document</button>}
                         </div>
                     </div>
+                )}
+
+                {/* ── Thumb bar ────────────────────────────────
+                    Phone only (styles.css hides it above 720px, and hides the
+                    top bar's copies of these actions below it). Every action
+                    here already exists at the top of the view; what it buys is
+                    reach — the top of a 6" screen is a two-handed stretch and
+                    these are the things you do most.
+
+                    A flex child of <main>, not a fixed overlay: it takes its own
+                    row, so nothing hides under it and the software keyboard
+                    pushes it off rather than floating it over the caret. It's
+                    absent while a document is open — that view's actions are
+                    formatting and Done, which live with the editor, and a bar
+                    under a keyboard is the one place a thumb can't reach. */}
+                {home && (
+                    <nav className="thumbbar" aria-label="Actions">
+                        <button className="thumb-act" onClick={() => setJump(true)}>
+                            <span className="thumb-glyph" aria-hidden="true">⌕</span>Search
+                        </button>
+                        {home === "root" ? (
+                            <>
+                                <button
+                                    className={`thumb-act${collForm === "follow" ? " on" : ""}`}
+                                    aria-expanded={collForm === "follow"}
+                                    onClick={() => setCollForm((f) => (f === "follow" ? null : "follow"))}
+                                >
+                                    <span className="thumb-glyph" aria-hidden="true">⇩</span>Subscribe
+                                </button>
+                                <button
+                                    className={`thumb-act primary${collForm === "new" ? " on" : ""}`}
+                                    aria-expanded={collForm === "new"}
+                                    onClick={() => setCollForm((f) => (f === "new" ? null : "new"))}
+                                >
+                                    <span className="thumb-glyph" aria-hidden="true">＋</span>Collection
+                                </button>
+                            </>
+                        ) : (
+                            <>
+                                <button className="thumb-act" onClick={() => setHome("root")}>
+                                    <span className="thumb-glyph" aria-hidden="true">⌂</span>Collections
+                                </button>
+                                {active && (
+                                    <button className="thumb-act" onClick={() => setHome(false)}>
+                                        <span className="thumb-glyph" aria-hidden="true">✎</span>Resume
+                                    </button>
+                                )}
+                                {repo?.writable && (
+                                    <button className="thumb-act primary" onClick={() => newNote()}>
+                                        <span className="thumb-glyph" aria-hidden="true">＋</span>Document
+                                    </button>
+                                )}
+                            </>
+                        )}
+                    </nav>
                 )}
             </main>
 

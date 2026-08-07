@@ -56,6 +56,29 @@ export function createFangornmdServer({ call, base }) {
     );
 
     server.registerTool(
+        "create_wiki",
+        {
+            title: "Create a wiki",
+            description:
+                "Make a new empty wiki under the token owner's address. Use it when a request needs a wiki that " +
+                "list_wikis does not show — do not scatter unrelated notes into an existing one. Creating costs " +
+                "nothing and touches no chain: the namespace is allocated by its first publish, which a human " +
+                "signs. Creating a wiki does not change which one is open in the browser, so name it with " +
+                "`namespace` on later calls.",
+            inputSchema: {
+                namespace: z.string().describe("the new wiki's name — 1-64 characters, no / \\ or :"),
+                visibility: z.enum(["public", "private"]).default("public").describe(
+                    "private seals notes in the owner's browser before publishing; the server never sees the plaintext",
+                ),
+            },
+        },
+        async ({ namespace, visibility }) => {
+            const r = await call("POST", "/api/repos", { namespace, visibility });
+            return text(`Created ${r.namespace} (${r.visibility}). Pass namespace: "${r.namespace}" to write notes into it.`);
+        },
+    );
+
+    server.registerTool(
         "list_notes",
         {
             title: "List notes",

@@ -297,7 +297,10 @@ body {
 /* ── Breadcrumb ──────────────────────────────────────────
    Replaces a bare title. In a folded tree the title alone tells you nothing
    about which branch you're on, and every segment here is a way back up. */
-.crumbs { display: flex; align-items: center; flex: 0 1 auto; min-width: 0; overflow: hidden; }
+/* `flex: 1 1 auto`, not `0 1 auto`: the trail should take the bar's slack
+   rather than sit at its intrinsic width and leave a gap before the spacer. It
+   still shrinks first, which is what the segment-dropping rule below assumes. */
+.crumbs { display: flex; align-items: center; flex: 1 1 auto; min-width: 0; overflow: hidden; }
 .crumb-seg { display: flex; align-items: center; min-width: 0; }
 .crumb {
     border: 0;
@@ -445,6 +448,9 @@ body {
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+/* A body-text hit shows the matching sentence, which reads from the left. */
+.jump-hint.snip { text-align: left; }
+.jump-hint.snip em { font-style: normal; color: var(--bloom); }
 
 .banner {
     display: flex;
@@ -765,6 +771,11 @@ body {
    The root level of the browser. Same row shape as a document one level down,
    so descending into a collection doesn't feel like changing app. */
 .coll-row { padding-left: 18px; }
+/* Name and facts in one wrapper, so the phone can stack what the desktop
+   ranges. `min-width: 0` on both is what actually lets the name ellipsize
+   instead of shoving the facts off the row. */
+.coll-main { display: flex; align-items: center; flex: 1; min-width: 0; }
+.coll-facts { display: flex; align-items: center; flex: none; min-width: 0; }
 .coll-title { font: 500 15px/1.4 var(--face-data); letter-spacing: -0.025em; }
 /* Words, not icons: these three facts decide what the namespace IS — who can
    read it, what you may do to it, and whether it exists off this disk. */
@@ -781,16 +792,63 @@ body {
     white-space: nowrap;
 }
 .coll-tag.private { border-color: var(--bloom-deep); color: var(--bloom); }
+/* Does this exist anywhere but this disk — the one fact that separates this
+   from a notes app. Same ●/◦ the switcher and the sidebar footer use, so the
+   glyph means one thing everywhere. Published is lit; local is not. */
 .coll-head {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     flex: none;
     align-self: center;
-    margin-left: auto;
+    margin-left: 12px;
     padding-left: 14px;
+    border-left: 1px solid var(--edge);
     font: 11px var(--face-data);
     color: var(--mist-dim);
     white-space: nowrap;
 }
+.coll-head.on { color: var(--bloom); }
 .coll-row .repo-dot { align-self: center; margin-left: 8px; }
+/* The tags are facts about the row; the name is the thing you clicked for. Push
+   the facts right on a wide screen, but let them collapse under the name rather
+   than squeeze it. */
+.coll-row .coll-facts { margin-left: auto; padding-left: 16px; }
+.coll-row .tree-actions { margin-left: 10px; }
+
+/* Creating or subscribing, inline under the bar. Full width because the
+   public/private choice can't be undone and its warning has to be readable. */
+.home-form {
+    padding: 4px 18px 14px;
+    border-bottom: 1px solid var(--edge);
+    background: var(--shade);
+}
+.home-form .repo-form { max-width: 460px; padding: 0; border: 0; }
+
+/* The first screen of an empty account. Centred and given room — this is the
+   only place the app explains what a collection is before you make one. */
+.home-start {
+    max-width: 42ch;
+    margin: 12vh auto 0;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+}
+.home-start p { font: 15px/1.6 var(--face-ui); color: var(--mist); }
+.home-start .home-start-sub { font-size: 13.5px; color: var(--mist-dim); }
+.home-start .btn { margin-top: 6px; }
+
+/* Leaving the editor. Quiet — it's a way out, not the page's primary action,
+   which is Publish and sits two controls to its right. */
+.done-edit { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+/* Publish belongs in the bar; this copy exists for the one phone case where the
+   bar can't hold it. See the media query. */
+.publish-in-menu { display: none; }
+
+/* Nothing in the bar's right-hand group may steal the breadcrumb's width. */
+.topbar > .view-switch, .topbar > .save-state, .topbar > .publish, .topbar > .more-pop { flex: none; }
 
 /* ── Publish ─────────────────────────────────────────────
    Publishing settles ONE namespace, so the button names it. The dot means the
@@ -832,6 +890,9 @@ body {
 }
 .home-search {
     flex: 1;
+    /* Without this the field refuses to shrink under its intrinsic width and
+       shoves the bar's buttons off the side of a phone. */
+    min-width: 0;
     max-width: 380px;
     padding: 7px 11px;
     border: 1px solid var(--edge);
@@ -842,6 +903,9 @@ body {
 }
 .home-search:focus { outline: none; border-color: var(--mist-dim); }
 .home-tally { flex: 1; font: 12px var(--face-data); color: var(--mist-dim); }
+/* A bar action keeps its label on one line and never gives up width — the
+   filter field is the elastic part. */
+.home-bar .btn { flex: none; white-space: nowrap; }
 .home-bulk {
     display: flex;
     align-items: center;
@@ -983,6 +1047,12 @@ body {
 .btn.share { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); font-weight: 600; }
 .btn.share:hover { background: var(--accent); color: var(--accent-text); }
 
+/* ── Thumb bar ───────────────────────────────────────────
+   Rendered only on the browsing views, shown only on a phone. Desktop has a
+   pointer that reaches the top of the window as easily as the bottom, so this
+   would just be a second copy of the same buttons. */
+.thumbbar { display: none; }
+
 /* ── Formatting toolbar ──────────────────────────────── */
 .fmt-bar {
     display: flex;
@@ -1073,14 +1143,45 @@ body {
        will drag. (The view switch stays: on a phone it is the ONLY way to the
        rendered document — split collapses to source here.) */
     .crumb-seg:not(:nth-last-child(-n+2)) { display: none; }
+
+    /* ── The editor bar on a phone ──────────────────────
+       With a document open this bar carries the document's controls on top of
+       the collection's, and at 390px they don't fit: everything else here has
+       `flex: none`, so the overflow lands entirely on the breadcrumb and it
+       collapses to zero width — the one element that says where you are.
+       Three things give way, in order of how little they cost:
+
+       1. `split` does nothing on a phone (the pane is hidden above), so a
+          third of the switch is a mode that changes nothing.
+       2. Publish moves into ⋯. It settles a transaction; it is not what you
+          reach for mid-sentence, and it is still a full button on the
+          collection view, where it names what you're looking at.
+       3. `saved` loses its word — the state still shows as a coloured dot. */
+    .topbar.editing .view-btn.split { display: none; }
+    .topbar.editing > .publish { display: none; }
+    .topbar.editing .publish-in-menu { display: block; }
+    .topbar.editing .save-state {
+        width: 7px;
+        height: 7px;
+        padding: 0;
+        border-radius: 50%;
+        overflow: hidden;
+        text-indent: 100%;
+        white-space: nowrap;
+        background: currentColor;
+    }
     .more-panel { right: -6px; }
     .home-bulk { position: sticky; top: 0; z-index: 2; }
 
     /* Anything under 16px makes iOS zoom the whole page on focus. */
     .repo-input, .collab-panel-input, .home-search, .jump-input { font-size: 16px; }
-    /* Comfortable thumb targets. */
-    .btn { padding: 8px 14px; }
-    .btn.small { padding: 6px 10px; }
+    /* Comfortable thumb targets. `min-height` rather than more padding, so a
+       button with a short label — ✓, ⋯ — is as tappable as one with a long
+       one instead of collapsing to the width of its glyph. */
+    .btn { padding: 8px 14px; min-height: 40px; }
+    .btn.small { padding: 6px 10px; min-height: 40px; }
+    .done-edit { min-width: 44px; justify-content: center; }
+    .view-btn { min-height: 36px; }
     .rail-item, .repo-item { padding: 11px 10px; }
     .home-title { padding-top: 12px; padding-bottom: 12px; }
     .tree-act { padding: 7px 6px; }
@@ -1088,6 +1189,62 @@ body {
     .grain { width: 15px; }
     .grain::before { left: 7px; }
     .jump-scrim { padding-top: 8vh; }
+
+    /* ── Thumb bar ──────────────────────────────────────
+       The bottom third of the screen is the only part a thumb reaches without
+       regripping, so the actions you repeat live there. `env(safe-area-inset-
+       bottom)` keeps the row off the iPhone home indicator, which otherwise
+       swallows the bottom ~34px of any bar flush with the edge. */
+    .thumbbar {
+        display: flex;
+        gap: 8px;
+        padding: 8px 12px;
+        padding-bottom: calc(8px + env(safe-area-inset-bottom));
+        border-top: 1px solid var(--edge);
+        background: var(--shade);
+    }
+    .thumb-act {
+        flex: 1;
+        min-width: 0;
+        /* 52px: comfortably past the 44px floor, because these are the targets
+           you hit fastest and least carefully. */
+        min-height: 52px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 3px;
+        padding: 6px 4px;
+        border: 1px solid var(--edge);
+        border-radius: var(--radius-sm);
+        background: var(--night);
+        color: var(--mist-dim);
+        font: 500 11px/1 var(--face-ui);
+        cursor: pointer;
+        /* A label that can't fit ellipsizes rather than wrapping the row taller. */
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .thumb-glyph { font-size: 17px; line-height: 1; }
+    .thumb-act:active { transform: translateY(1px); }
+    /* The open form's button stays lit — the form appears at the TOP of the
+       view, far from the thumb that opened it, so without this a tap looks like
+       it did nothing. */
+    .thumb-act.on { border-color: var(--bloom); color: var(--mist); background: var(--accent-soft); }
+    .thumb-act.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--accent-text);
+        font-weight: 600;
+    }
+    .thumb-act.primary.on { background: var(--bloom-deep); border-color: var(--bloom-deep); color: var(--mist); }
+
+    /* The top bar's copies of exactly these actions. One set per screen. */
+    .home-bar > .btn { display: none; }
+    /* The list scrolls under its own bar now, so the old runway for a
+       floating-nothing is just dead space above a real one. */
+    .home-list { padding-bottom: 12vh; }
 }
 
 /* The date and the tally are the first things to go — depth and name are what
@@ -1096,6 +1253,31 @@ body {
     .home-when { display: none; }
     .home-tally { display: none; }
     .tree-actions { margin-left: auto; }
+
+    /* A collection row stacks: the name gets the full width on its own line and
+       the facts sit under it. Ranged on one line they all competed, and the
+       name — the only part you navigate by — was the part that truncated. */
+    .coll-main { flex-direction: column; align-items: stretch; }
+    .coll-title { padding-bottom: 2px; }
+    .coll-row .coll-facts { margin-left: 0; padding-left: 0; padding-bottom: 10px; }
+    .coll-tag:first-child { margin-left: 0; }
+    .coll-head { margin-left: auto; padding-left: 10px; }
+    /* The row's own name is the tap target; keep the whole stack comfortable. */
+    .coll-row { padding-left: 14px; }
+    .coll-row .tree-actions { align-items: flex-start; padding-top: 6px; }
+
+    /* On the smallest screens the trail can only answer one question, so it
+       answers the one you can't get anywhere else: which document is this.
+       Going up is what ✓ and the drawer are for. */
+    .topbar.editing .crumb.root,
+    .topbar.editing .crumb-seg:not(:last-child) { display: none; }
+    .topbar.editing .crumb-seg:last-child .crumb-sep { display: none; }
+
+    /* "Done" is the glyph alone here — the bar is the tightest space in the app
+       and a check reads as finished without the word. */
+    .done-word { display: none; }
+    .home-form { padding-left: 12px; padding-right: 12px; }
+    .home-start { margin-top: 8vh; }
 }
 
 /* Touch has no hover, so hover-revealed controls are simply unreachable. */

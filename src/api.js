@@ -50,6 +50,9 @@ export const api = {
             body: JSON.stringify({ namespace, collaborators }),
         }).then(json),
     notes: () => get("/api/notes"),
+    // Full text, every collection you track — the palette's own ranking only
+    // sees the open collection's titles.
+    search: (q) => get(`/api/search?q=${encodeURIComponent(q)}`),
     note: (path) => get(`/api/notes/${encodeURIComponent(path)}`),
     // `ns` names the target namespace instead of leaning on the server's active
     // pointer. Any write that spans an await the user can interrupt — a wallet

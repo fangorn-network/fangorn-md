@@ -11,6 +11,7 @@ import { setupWSConnection, setPersistence, docs as yRooms } from "@y/websocket-
 import * as Y from "yjs";
 import { docMarkdown, seedFromMarkdown, replaceMarkdown, isReadFrame, encodeRoomState, applyRoomState } from "./ydoc.js";
 import { buildWikiGraph, latestByPath, latestEdges } from "./graph.js";
+import { sweepRoomSnapshots } from "./sweep.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createFangornmdServer, httpCall } from "../mcp/tools.js";
 // Shared with the browser: one renderer for the pane, the export and the
@@ -402,6 +403,33 @@ function readJson(req) {
 
 const firstHeading = (content, fallback) => content?.match(/^#\s+(.+)$/m)?.[1]?.trim() ?? fallback;
 
+// Title + links for the sidebar, memoised on (mtime, size).
+//
+// GET /api/notes is the hottest route there is — every tab re-lists on every
+// local-change event — and the only reason it reads a note's BODY is to pull
+// the first heading and the [[links]] out of it. Without this, one keystroke in
+// one note re-reads and re-scans every file in the wiki, per connected tab.
+// mtime+size is the same freshness test `syncedAt` already trusts elsewhere.
+//
+// ponytail: entries for deleted notes linger until restart — a few dozen bytes
+// each, keyed by path, so a wiki churns through names for a long time before
+// this is worth a prune.
+const noteMeta = new Map();
+function readNoteMeta(dir, path) {
+    const { mtimeMs, size } = statSync(join(dir, path));
+    const key = `${dir}/${path}`;
+    const hit = noteMeta.get(key);
+    if (hit && hit.mtimeMs === mtimeMs && hit.size === size) return hit;
+    const content = readFileSync(join(dir, path), "utf-8");
+    const meta = {
+        mtimeMs, size,
+        title: firstHeading(content, path.replace(/\.md$/, "")),
+        links: [...new Set(extractMarkdownLinks(content).map((id) => `${id}.md`))],
+    };
+    noteMeta.set(key, meta);
+    return meta;
+}
+
 const indexBoilerplate = (namespace) => `# ${namespace}
 
 Welcome to your new wiki. This note is **index.md** — the root of your tree.
@@ -491,6 +519,26 @@ function pullRepo(repo, latest) {
 // already in that single topic filter — each connection just picks out the
 // repos it tracks.
 
+// ONE recursive watcher for the process, not one per connection per tracked
+// repo. Every working tree lives under docs/, so a single watch covers them all
+// and each connection just filters the relative path. Recursive watching costs
+// an inotify handle per DIRECTORY on Linux, and a Pi's default limit is small
+// enough that a few tabs × a few wikis can exhaust it — after which changes
+// stop being noticed, silently.
+const DOCS_ROOT = join(DATA_DIR, "docs");
+const localListeners = new Set();
+let docsWatcher = null;
+function watchDocs(listener) {
+    mkdirSync(DOCS_ROOT, { recursive: true });
+    // `filename` is relative to DOCS_ROOT (`<owner>/<namespace>/<note>`), and
+    // null on the platforms that don't report it — then everyone hears it.
+    docsWatcher ??= watch(DOCS_ROOT, { recursive: true }, (_e, filename) => {
+        for (const l of localListeners) if (!filename || l.wants(filename)) l.fire();
+    });
+    localListeners.add(listener);
+    return () => localListeners.delete(listener);
+}
+
 async function handleEvents(req, res, url) {
     let address;
     try { ({ address } = await authenticate(url.searchParams.get("token"), url.searchParams.get("address"))); }
@@ -504,15 +552,17 @@ async function handleEvents(req, res, url) {
     // co-edit lives under the OWNER's directory, so watching docs/<us> alone
     // would miss every change a friend makes.
     const repos = userStore(address).list();
-    const dirs = new Set([join(DATA_DIR, "docs", address), ...repos.map((r) => join(DATA_DIR, r.dir))]);
+    // Our own root plus every shared tree we collaborate in, as paths relative
+    // to docs/ — a repo we co-edit lives under the OWNER's directory, so
+    // `${address}/` alone would miss every change a friend makes.
+    const prefixes = [...new Set([`${address}/`, ...repos.map((r) => `${r.dir.replace(/^docs\//, "")}/`)])];
     let debounce = null;
-    const onLocal = () => {
-        clearTimeout(debounce);
-        debounce = setTimeout(() => write("local-change", {}), 200);
-    };
-    const localWatchers = [...dirs].map((dir) => {
-        mkdirSync(dir, { recursive: true });
-        return watch(dir, { recursive: true }, onLocal);
+    const unwatch = watchDocs({
+        wants: (file) => prefixes.some((p) => file.startsWith(p)),
+        fire: () => {
+            clearTimeout(debounce);
+            debounce = setTimeout(() => write("local-change", {}), 200);
+        },
     });
 
     const tracked = new Set(repos.map(cacheKey));
@@ -530,7 +580,7 @@ async function handleEvents(req, res, url) {
     req.on("close", () => {
         clearInterval(heartbeat);
         clearTimeout(debounce);
-        for (const w of localWatchers) w.close();
+        unwatch();
         offFeed();
     });
 }
@@ -554,9 +604,12 @@ const routes = {
 
     // Create a repo LOCALLY — no on-chain tx. The namespace is allocated on-chain
     // by its first publish (which parents on the user's current root).
-    "POST /api/repos": async ({ address, body }) => {
+    "POST /api/repos": async ({ address, body, agent, agentNs }) => {
         const namespace = String(body.namespace ?? "").trim();
         if (!NAMESPACE.test(namespace)) throw new HttpError(400, "invalid name — 1-64 characters, no / \\ or :");
+        // A pinned token reaches exactly one namespace; a new one it could not
+        // then write to is only litter in someone else's sidebar.
+        if (agentNs && agentNs !== namespace) throw new HttpError(403, `this token is pinned to ${agentNs}`);
         const s = userStore(address);
         if (s.read().repos[namespace]) throw new HttpError(409, `already tracking ${namespace}`);
         const visibility = body.visibility === "private" ? "private" : "public";
@@ -572,8 +625,14 @@ const routes = {
         const tip = await fangorn.onChainTip(address, namespace).catch(() => null);
         const index = join(abs, "index.md");
         if (!tip && !existsSync(index)) writeFileSync(index, indexBoilerplate(namespace), "utf-8");
+        // `add` makes the new repo active, which is right for a person — they
+        // just asked for it — and wrong for an agent, which would yank the
+        // human's editor to another wiki mid-sentence. Same reason
+        // POST /api/repos/active is human-only.
+        const wasActive = s.activeOrNull()?.namespace ?? null;
         s.add({ namespace, owner: address, head: tip ?? null, visibility, dir });
-        return publicRepo(s.active(), address);
+        if (agent && wasActive) s.setActive(wasActive);
+        return publicRepo(s.get(namespace), address);
     },
 
     // Track someone else's namespace read-only (owner + namespace).
@@ -652,13 +711,54 @@ const routes = {
         const paths = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".md")) : [];
         const known = new Set(paths);
         const notes = paths.map((path) => {
-            const content = readFileSync(join(dir, path), "utf-8");
-            const links = [...new Set(extractMarkdownLinks(content).map((id) => `${id}.md`))].filter((t) => t !== path && known.has(t));
             // mtime/size are for the Files view's columns; the editor ignores them.
-            const { mtimeMs, size } = statSync(join(dir, path));
-            return { path, title: firstHeading(content, path.replace(/\.md$/, "")), links, updatedAt: mtimeMs, size };
+            const { title, links, mtimeMs, size } = readNoteMeta(dir, path);
+            // Filtered per call, not cached: whether a link resolves depends on
+            // the other notes, not on this one's bytes.
+            return { path, title, links: links.filter((t) => t !== path && known.has(t)), updatedAt: mtimeMs, size };
         });
         return { notes, tree: reconcileTree(repo).tree };
+    },
+
+    // Search every collection the caller tracks, body text included — the ⌘K
+    // palette can only rank titles it already has, and the thing people actually
+    // ask for is "the note where I wrote about X".
+    //
+    // Server-side because that is the only place the whole corpus exists: the
+    // browser holds one namespace's notes at a time, and shipping every body to
+    // it to grep locally is the same read with a download attached.
+    //
+    // ponytail: linear scan, substring match, no index. A few hundred notes per
+    // user reads in single-digit ms. If a corpus ever gets big enough to feel
+    // it, the upgrade is an inverted index behind this same route — or
+    // embeddings, which is the same shape of change and still fits here.
+    "GET /api/search": async (p) => {
+        const q = String(p.q ?? "").trim().toLowerCase();
+        if (q.length < 2) return { hits: [] };
+        const hits = [];
+        for (const repo of userStore(p.address).list()) {
+            // A pinned agent token searches only what it can read.
+            if (p.agentNs && repo.namespace !== p.agentNs) continue;
+            const dir = docsDir(repo);
+            if (!existsSync(dir)) continue;
+            for (const path of readdirSync(dir).filter((f) => f.endsWith(".md"))) {
+                const { title } = readNoteMeta(dir, path);
+                const body = readFileSync(join(dir, path), "utf-8");
+                const at = body.toLowerCase().indexOf(q);
+                // Rank is "how early and how strong": a title hit beats a body
+                // hit in any note, so the note you named comes first.
+                const inTitle = title.toLowerCase().includes(q) || path.toLowerCase().includes(q);
+                if (!inTitle && at < 0) continue;
+                const from = Math.max(0, at - 40);
+                hits.push({
+                    namespace: repo.namespace, path, title,
+                    score: inTitle ? 0 : 1000 + at,
+                    snippet: at < 0 ? "" :
+                        (from ? "…" : "") + body.slice(from, at + q.length + 80).replace(/\s+/g, " ").trim() + "…",
+                });
+            }
+        }
+        return { hits: hits.sort((a, b) => a.score - b.score).slice(0, 30) };
     },
 
     // Drag-and-drop persisted the reordered hierarchy.
@@ -1067,12 +1167,24 @@ const MIME = {
     ".ico": "image/x-icon", ".woff2": "font/woff2", ".map": "application/json",
 };
 
+const isFile = (p) => { try { return statSync(p).isFile(); } catch { return false; } };
+
 function serveStatic(res, pathname) {
     if (!existsSync(DIST)) return sendJson(res, 404, { error: "no dist/ — run `vite build`" });
     const rel = normalize(pathname).replace(/^(\.\.[/\\])+/, "");
     let file = join(DIST, rel);
-    if (!file.startsWith(DIST) || !existsSync(file) || pathname === "/") file = join(DIST, "index.html");
-    res.writeHead(200, { "Content-Type": MIME[extname(file)] ?? "application/octet-stream" });
+    // isFile, not exists: a request for a DIRECTORY under dist/ (`/assets/`)
+    // passes existsSync and then throws EISDIR out of an async handler — an
+    // unhandled rejection that takes the process down. Any crawler finds it.
+    if (!file.startsWith(DIST) || !isFile(file) || pathname === "/") file = join(DIST, "index.html");
+    // dist/assets/* carry a content hash in the name, so they can never go
+    // stale — telling the browser that is the difference between re-shipping a
+    // multi-megabyte bundle off an SD card through a home tunnel on every load
+    // and shipping it once. index.html is the one file whose name is fixed.
+    res.writeHead(200, {
+        "Content-Type": MIME[extname(file)] ?? "application/octet-stream",
+        "Cache-Control": pathname.startsWith("/assets/") ? "public, max-age=31536000, immutable" : "no-cache",
+    });
     res.end(readFileSync(file));
 }
 
@@ -1090,12 +1202,17 @@ const server = createServer(async (req, res) => {
         try { return await servePublic(req, res, url.pathname); }
         catch (err) { console.error(err); return sendText(res, 502, "could not read the published namespace"); }
     }
-    if (req.method === "GET" && !url.pathname.startsWith("/api/")) return serveStatic(res, url.pathname);
+    // Seatbelt: this handler is async, so anything thrown synchronously here is
+    // an unhandled rejection, and an unhandled rejection is a dead server.
+    if (req.method === "GET" && !url.pathname.startsWith("/api/")) {
+        try { return serveStatic(res, url.pathname); }
+        catch (err) { console.error(err); return sendText(res, 500, "could not serve that"); }
+    }
 
     let key = `${req.method} ${url.pathname}`;
     // `?ns=` lets one agent token address every wiki its owner has, naming the
     // target per call instead of carrying it in the credential.
-    const params = { ns: url.searchParams.get("ns") || null };
+    const params = { ns: url.searchParams.get("ns") || null, q: url.searchParams.get("q") || "" };
     const renameMatch = url.pathname.match(/^\/api\/notes\/(.+)\/rename$/);
     // A literal route wins over the `:path` pattern, or /api/notes/delete parses
     // as a note named "delete".
@@ -1292,10 +1409,31 @@ server.on("upgrade", async (req, socket, head) => {
         setupWSConnection(writer ? conn : readOnlyConn(conn), req, { docName }));
 });
 
+// ─── Janitor ────────────────────────────────────────────────────────────────
+//
+// Room snapshots are staged state, not durable state (see sweep.js). Nothing
+// deletes one when a note is simply abandoned, so they are swept on age.
+const ROOMS_DIR = join(DATA_DIR, ".fangorn", "rooms");
+const SNAPSHOT_TTL_MS = Number(process.env.SNAPSHOT_TTL_MS ?? 24 * 3600_000);
+const SWEEP_EVERY_MS = Number(process.env.SWEEP_EVERY_MS ?? 3600_000);
+const sweep = () => {
+    try {
+        const removed = sweepRoomSnapshots(ROOMS_DIR, {
+            maxAgeMs: SNAPSHOT_TTL_MS,
+            isLive: (owner, ns, note) => yRooms.has(`${owner}:${ns}:${note}`),
+        });
+        if (removed.length) console.log(`[sweep] purged ${removed.length} stale room snapshot(s)`);
+    } catch (err) {
+        console.error("[sweep]", err.message); // a janitor must never take the server down
+    }
+};
+
 const appOwner = await assertAppRegistered();
 
 server.listen(PORT, () => {
     mkdirSync(USERS_DIR, { recursive: true });
+    sweep();
+    setInterval(sweep, SWEEP_EVERY_MS).unref();
     console.log(`fangornmd server → http://localhost:${PORT}`);
     console.log(`  mode:    multi-tenant relay (self-custodial — holds no user keys)`);
     console.log(`  service: ${fangorn.getAddress()} (engine + Pinata only)`);
