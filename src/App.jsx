@@ -1021,13 +1021,9 @@ export default function App({ address, onLogout }) {
     const [home, setHome] = useState(false);
     const [jump, setJump] = useState(false);
     const [collForm, setCollForm] = useState(null); // "new" | "follow" | null — see CollectionList
-    // Search hides while you scroll INTO a document and comes back the moment
-    // you head back up. Only ever true on a phone (the collapse rule lives in a
-    // media query); the flag is set unconditionally because it costs nothing and
-    // a matchMedia listener up here would be a second source of truth for a
-    // breakpoint the stylesheet already owns.
-    const [scrollingDown, setScrollingDown] = useState(false);
-    const lastScrollY = useRef(0);
+    // The bars that hide while you scroll into a document read this element's
+    // class (see the `scrolled-down` rules, which only exist on a phone).
+    const mainRef = useRef(null);
     // An incoming share link (?owner=&ns=&note=) — parsed once on mount.
     const [share, setShare] = useState(() => {
         const p = new URLSearchParams(window.location.search);
@@ -1132,20 +1128,41 @@ export default function App({ address, onLogout }) {
         };
     }, []);
 
-    // Which way the pane is scrolling, for the search bar. The editor, the
-    // rendered pane and the two browsing lists are four separate scroll
-    // containers and scroll does NOT bubble, so this is one capture-phase
-    // listener on the document rather than a handler wired into each of them.
+    // ── Which way the pane is scrolling ───────────────────────────
+    // The editor, the rendered pane and the two browsing lists are four
+    // separate scroll containers and scroll does NOT bubble, so this is one
+    // capture-phase listener on the document rather than a handler wired into
+    // each of them.
+    //
+    // It writes a CLASS, not React state. Scroll fires per frame; setState per
+    // frame re-rendered the whole app — Slate included — while a finger was
+    // moving, which is what made this jitter. The same reasoning as the drag
+    // marks up in HomeRow: feedback that lasts exactly as long as a gesture and
+    // re-renders nothing is a DOM class.
     useEffect(() => {
+        let last = 0, down = false;
         const onScroll = (e) => {
             const y = e.target?.scrollTop ?? 0;
-            // Past 48px, so the bar can't flicker on the rubber-band at the top.
-            setScrollingDown(y > 48 && y > lastScrollY.current);
-            lastScrollY.current = y;
+            // Collapsing the bars CHANGES THE PANE'S HEIGHT, which nudges
+            // scrollTop, which fires scroll, which would flip the state back —
+            // the oscillation you feel as jitter. Ignoring moves smaller than
+            // the bars are tall breaks that loop; a real flick clears it by an
+            // order of magnitude.
+            if (Math.abs(y - last) < 24) return;
+            // Past 48px, so nothing flickers on the rubber-band at the top.
+            const next = y > 48 && y > last;
+            last = y;
+            if (next === down) return;
+            down = next;
+            mainRef.current?.classList.toggle("scrolled-down", down);
         };
         document.addEventListener("scroll", onScroll, true);
         return () => document.removeEventListener("scroll", onScroll, true);
     }, []);
+
+    // A new note (or the browser) starts at the top with the bars up — the
+    // class is ours, so nothing else clears it.
+    useEffect(() => { mainRef.current?.classList.remove("scrolled-down"); }, [active, home]);
 
     // ⌘K / Ctrl-K from anywhere, including with the caret inside the editor —
     // capture, so Slate doesn't get to swallow it first.
@@ -1582,7 +1599,7 @@ export default function App({ address, onLogout }) {
             </aside>
             {navOpen && <div className="nav-backdrop" onClick={() => setNavOpen(false)} />}
 
-            <main className={`main${scrollingDown ? " scrolled-down" : ""}`}>
+            <main className="main" ref={mainRef}>
                 {/* Search, at full width, in every view — it was a 13px box at
                     the bottom of a drawer, which on a phone made the fastest
                     path to anything the hardest one to find. A button dressed as
