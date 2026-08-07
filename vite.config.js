@@ -18,6 +18,13 @@ export default defineConfig({
                 target: "http://localhost:8787",
                 changeOrigin: true,
             },
+            // The public, no-login read view. Without this, dev serves the SPA
+            // shell for /r/… and a share link copied in dev goes to a login
+            // wall — the exact thing that route exists to avoid.
+            "/r/": {
+                target: "http://localhost:8787",
+                changeOrigin: true,
+            },
             // Yjs live-collab relay (see server/index.js) — needs WS upgrades.
             "/yjs": {
                 target: "ws://localhost:8787",

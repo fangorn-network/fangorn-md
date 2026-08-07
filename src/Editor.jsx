@@ -207,7 +207,22 @@ function FormatBar({ editor }) {
                         // mousedown (not click) + preventDefault: keeps focus and
                         // the live selection in the editor, so the transform has
                         // a target.
-                        onMouseDown={(ev) => { ev.preventDefault(); fn(editor); ReactEditor.focus(editor); }}
+                        //
+                        // Focus in a microtask, not inline: slate flushes
+                        // `editor.operations` in one, and ReactEditor.focus
+                        // retries on a 10ms TIMER while any are pending — a
+                        // timer nobody cancels when the editor unmounts, which
+                        // then throws "Cannot resolve a DOM node" from inside
+                        // the timeout. After the flush it takes the synchronous
+                        // path. The catch is for the tap that leaves the note
+                        // between the two.
+                        onMouseDown={(ev) => {
+                            ev.preventDefault();
+                            fn(editor);
+                            queueMicrotask(() => {
+                                try { ReactEditor.focus(editor); } catch { /* editor left the screen */ }
+                            });
+                        }}
                     >
                         {label}
                     </button>

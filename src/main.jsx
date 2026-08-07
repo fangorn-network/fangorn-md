@@ -19,12 +19,32 @@ function Gate() {
     if (!ready) return <div className="gate">…</div>;
 
     if (!authenticated) {
+        // Someone arrived on a share link (?owner=&ns=&note=). Reading a public
+        // namespace needs no identity at all — the server renders it at /r/…
+        // without a token — so the wall here is only for the app itself, and
+        // this offers the way past it. Making a stranger create a wallet to read
+        // a page that is public on-chain is the opposite of the point.
+        const p = new URLSearchParams(window.location.search);
+        const owner = p.get("owner"), ns = p.get("ns");
+        const readUrl = owner && ns &&
+            `/r/${[owner, ns, p.get("note") || "index.md"].map(encodeURIComponent).join("/")}`;
         return (
             <div className="gate">
                 <div className="gate-card">
                     <h1>🌲 fangornmd</h1>
-                    <p>Your notes, published to a network you own — not a company's database.</p>
-                    <button className="btn primary" onClick={login}>Log in</button>
+                    {readUrl ? (
+                        <>
+                            <p><b>{ns}</b> was shared with you. Read it as it is, or log in to subscribe
+                                — a subscription tracks it in your own app and stays current.</p>
+                            <a className="btn primary link-btn" href={readUrl}>Read {ns}</a>
+                            <button className="btn" onClick={login}>Log in to subscribe</button>
+                        </>
+                    ) : (
+                        <>
+                            <p>Your notes, published to a network you own — not a company's database.</p>
+                            <button className="btn primary" onClick={login}>Log in</button>
+                        </>
+                    )}
                 </div>
             </div>
         );

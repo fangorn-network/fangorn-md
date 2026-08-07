@@ -55,6 +55,30 @@ const printDocument = (html) => {
     document.body.appendChild(frame);
 };
 
+// ── Leaving the editor while Gboard is mid-word ───────────────────
+// Slate's Android input manager (slate-react's useAndroidInputManager) holds
+// pending IME diffs in bare setTimeouts — compositionend + 25ms, plus a 0ms
+// action flush — and cancels NONE of them when <Editable> unmounts. Anything
+// that takes the editor off screen inside that window therefore
+//   1. drops the word you were finishing, and
+//   2. throws "Cannot resolve a DOM node from Slate node: {the whole editor}"
+//      out of a timer, inside the library, where no try/catch of ours reaches.
+// It was always latent; it became easy to hit when Done and ＋ moved to the
+// thumb bar, because leaving the editor stopped being a trip to the far corner
+// of the screen. Blurring commits the composition, and 30ms is longer than
+// slate's RESOLVE_DELAY and shorter than anyone notices. There's nothing to
+// wait for when the caret isn't in a document — the common case, and free.
+//
+// Every route out of the editor goes through this: openNote covers the
+// palette, the sidebar, breadcrumbs and backlinks; the two Done buttons and
+// the collection views call it themselves.
+const settleIme = () => {
+    const el = document.activeElement;
+    if (!el?.isContentEditable) return null;
+    el.blur();
+    return new Promise((done) => setTimeout(done, 30));
+};
+
 // Parse a repo reference to follow: a pasted share URL (?owner=&ns=&note=), or
 // a bare "owner/namespace". Returns { owner, ns, note } or null.
 export function parseRepoRef(input) {
@@ -1023,6 +1047,7 @@ export default function App({ address, onLogout }) {
     }, []);
 
     const openNote = useCallback(async (path) => {
+        await settleIme();
         const note = await api.note(path);
         setActive(path);
         setContent(note.content);
@@ -1256,19 +1281,26 @@ export default function App({ address, onLogout }) {
         }
     };
 
-    // Sharing (public repos): copy a link that lets a friend follow this repo.
-    // The repo is already public on-chain — the link just carries (owner, ns) so
-    // their app can clone it; ?note focuses one page on open.
+    // Sharing (public repos): a link to the READ view, not to this app.
+    //
+    // It used to point at the SPA with ?owner=&ns=&note=, which is behind the
+    // login gate — so the first thing a stranger met was "create a wallet", to
+    // read a page that is public on-chain and already rendered by the server at
+    // /r/…. Reading is the thing that needs no identity; the served page carries
+    // its own "Subscribe to this wiki →" link back here for the one action that
+    // does. The old ?owner= URLs still work, and the gate now offers the same
+    // escape (see main.jsx).
     const shareLink = () => {
         if (!repo) return;
-        const url = new URL(window.location.origin + window.location.pathname);
-        url.searchParams.set("owner", repo.owner);
-        url.searchParams.set("ns", repo.namespace);
-        if (active) url.searchParams.set("note", active);
-        navigator.clipboard?.writeText(url.toString());
+        // Encoded per segment, and a note path containing "/" survives it: the
+        // server splits on "/" BEFORE decoding, so %2F stays one segment.
+        const path = [repo.owner, repo.namespace, active ?? "index.md"].map(encodeURIComponent).join("/");
+        navigator.clipboard?.writeText(`${window.location.origin}/r/${path}`);
         setStatus({
             kind: "ok",
-            text: repo.head ? "share link copied — anyone can paste it to subscribe" : "link copied — Publish first so subscribers see anything",
+            text: repo.head
+                ? "read link copied — anyone can open it, no login"
+                : "link copied — but nothing is published yet, so it's empty until you Publish",
         });
     };
 
@@ -1429,6 +1461,10 @@ export default function App({ address, onLogout }) {
         }
     };
 
+    // Every "leave the document" button — Done, the breadcrumb, the rail, the
+    // thumb bar. Same reason as openNote's settle: see settleIme.
+    const leaveTo = async (which) => { await settleIme(); setHome(which); };
+
     const navigate = async (path) => {
         if (notes.some((n) => n.path === path)) await openNote(path);
         else setStatus({ kind: "err", text: `no such note: ${path}` });
@@ -1497,10 +1533,10 @@ export default function App({ address, onLogout }) {
                 <nav className="rail">
                     {/* Not "All notes": this shows ONE namespace, and a label that
                         implied every namespace is why `second brain` looked missing. */}
-                    <button className={`rail-item${home === "root" ? " active" : ""}`} onClick={() => setHome("root")}>
+                    <button className={`rail-item${home === "root" ? " active" : ""}`} onClick={() => leaveTo("root")}>
                         ⌂ All collections
                     </button>
-                    <button className={`rail-item${home === "space" ? " active" : ""}`} onClick={() => setHome("space")}>
+                    <button className={`rail-item${home === "space" ? " active" : ""}`} onClick={() => leaveTo("space")}>
                         ☰ This collection
                     </button>
                     {repo?.writable && <button className="rail-item" onClick={() => newNote()}>＋ New document</button>}
@@ -1604,7 +1640,7 @@ export default function App({ address, onLogout }) {
                     <nav className="crumbs" aria-label="Breadcrumb">
                         <button
                             className={`crumb root${home === "root" ? " here" : ""}`}
-                            onClick={() => setHome("root")}
+                            onClick={() => leaveTo("root")}
                             title="Every collection you track"
                         >
                             collections
@@ -1614,7 +1650,7 @@ export default function App({ address, onLogout }) {
                                 <span className="crumb-sep" aria-hidden="true">/</span>
                                 <button
                                     className={`crumb coll${home === "space" ? " here" : ""}`}
-                                    onClick={() => setHome("space")}
+                                    onClick={() => leaveTo("space")}
                                     title={`Every document in ${repo.namespace}`}
                                 >
                                     {repo.namespace}
@@ -1669,7 +1705,7 @@ export default function App({ address, onLogout }) {
                     {active && !home && (
                         <button
                             className="btn small done-edit"
-                            onClick={() => setHome("space")}
+                            onClick={() => leaveTo("space")}
                             title={`Done — back to ${repo?.namespace ?? "the collection"}`}
                         >
                             <span aria-hidden="true">✓</span>
@@ -1862,7 +1898,7 @@ export default function App({ address, onLogout }) {
                     <div className="empty">
                         <p>Nothing open.</p>
                         <div className="empty-acts">
-                            <button className="btn" onClick={() => setHome("space")}>Browse this namespace</button>
+                            <button className="btn" onClick={() => leaveTo("space")}>Browse this namespace</button>
                             {repo?.writable && <button className="btn primary" onClick={() => newNote()}>Write a document</button>}
                         </div>
                     </div>
@@ -1911,11 +1947,11 @@ export default function App({ address, onLogout }) {
                     </>
                 ) : home ? (
                     <>
-                        <button className="thumb-act" onClick={() => setHome("root")}>
+                        <button className="thumb-act" onClick={() => leaveTo("root")}>
                             <span className="thumb-glyph" aria-hidden="true">⌂</span>Collections
                         </button>
                         {active && (
-                            <button className="thumb-act" onClick={() => setHome(false)}>
+                            <button className="thumb-act" onClick={() => leaveTo(false)}>
                                 <span className="thumb-glyph" aria-hidden="true">✎</span>Resume
                             </button>
                         )}
@@ -1930,7 +1966,7 @@ export default function App({ address, onLogout }) {
                         {/* Same move as the topbar's ✓, in the corner a thumb
                             already rests in. It says Done, not Save: the text is
                             saved as you type and promising otherwise would lie. */}
-                        <button className="thumb-act" onClick={() => setHome("space")}>
+                        <button className="thumb-act" onClick={() => leaveTo("space")}>
                             <span className="thumb-glyph" aria-hidden="true">✓</span>Done
                         </button>
                         {repo?.writable && (

@@ -1106,6 +1106,10 @@ body {
 .gate-card { text-align: center; padding: 40px 44px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 12px; max-width: 380px; }
 .gate-card h1 { margin: 0 0 12px; font-size: 24px; }
 .gate-card p { color: var(--text-dim); margin: 0 0 22px; line-height: 1.5; }
+/* Read is a navigation, so it's an <a> — a real link a stranger can middle-click
+   or copy. `.btn` alone assumes a <button>. */
+.link-btn { display: inline-block; text-decoration: none; }
+.gate-card .btn + .btn, .gate-card .link-btn + .btn { margin-left: 8px; }
 .account-bar { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: 8px; font-size: 12px; }
 .account-addr { color: var(--text-dim); font-family: var(--face-data); background: none; border: 0; padding: 0; font-size: 11px; cursor: pointer; }
 .account-addr:hover:enabled { color: var(--text); }
