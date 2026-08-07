@@ -1924,7 +1924,10 @@ export default function App({ address, onLogout }) {
                 things you reach for from inside a note as often as from the
                 list, and Done at the bottom-right is a shorter trip than Done in
                 the top-right corner (the topbar's copy is hidden on phones). */}
-            <nav className="thumbbar" aria-label="Actions">
+            {/* `editing` is what lets the bar duck out of the way on scroll —
+                see styles.css. Only in a document: on the browsing lists this
+                bar IS the navigation, and a list scrolls constantly. */}
+            <nav className={`thumbbar${home ? "" : " editing"}`} aria-label="Actions">
                 <button className="thumb-act" onClick={() => setJump(true)}>
                     <span className="thumb-glyph" aria-hidden="true">⌕</span>Search
                 </button>

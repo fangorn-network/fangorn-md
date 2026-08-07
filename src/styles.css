@@ -1220,6 +1220,22 @@ body {
         padding-bottom: calc(8px + env(safe-area-inset-bottom));
         border-top: 1px solid var(--edge);
         background: var(--shade);
+        /* Finite, so the collapse below has somewhere to go. */
+        max-height: 96px;
+        overflow: hidden;
+        transition: max-height 0.18s ease, padding 0.18s ease, opacity 0.14s ease;
+    }
+    /* In a document, the bar ducks on the same signal the search bar does —
+       and typing at the bottom of a note IS a scroll down, which is exactly
+       when four buttons in the way are worst. With the keyboard up there are
+       only a few lines of document visible; this gives them back. Flick up and
+       both bars return together. */
+    .main.scrolled-down ~ .thumbbar.editing {
+        max-height: 0;
+        padding-top: 0;
+        padding-bottom: 0;
+        opacity: 0;
+        border-top-width: 0;
     }
     .thumb-act {
         flex: 1;
@@ -1334,5 +1350,5 @@ body {
 @media (prefers-reduced-motion: reduce) {
     .sidebar { transition: none; }
     .btn { transition: none; }
-    .search-bar { transition: none; }
+    .search-bar, .thumbbar { transition: none; }
 }
