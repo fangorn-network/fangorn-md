@@ -65,18 +65,25 @@ const printDocument = (html) => {
 //      out of a timer, inside the library, where no try/catch of ours reaches.
 // It was always latent; it became easy to hit when Done and ＋ moved to the
 // thumb bar, because leaving the editor stopped being a trip to the far corner
-// of the screen. Blurring commits the composition, and 30ms is longer than
-// slate's RESOLVE_DELAY and shorter than anyone notices. There's nothing to
-// wait for when the caret isn't in a document — the common case, and free.
+// of the screen.
 //
-// Every route out of the editor goes through this: openNote covers the
-// palette, the sidebar, breadcrumbs and backlinks; the two Done buttons and
-// the collection views call it themselves.
+// The wait has to outlast the LONGEST of those timers, not the shortest. Slate
+// arms `flushTimeoutId = setTimeout(flush, FLUSH_DELAY)` on input with
+// FLUSH_DELAY = 200ms, so a tap 50ms after your last keystroke leaves a flush
+// due 150ms later — an earlier 30ms wait here (RESOLVE_DELAY + slack) missed it
+// entirely and the crash kept happening. 220ms is the library's number plus a
+// frame. It is paid only when the caret is actually in a document, and on
+// openNote it disappears into the fetch that follows.
+//
+// Every route out of the editor goes through this: openNote covers the palette,
+// the sidebar, breadcrumbs and backlinks; the Done buttons and the view switch
+// call it themselves.
+const IME_SETTLE_MS = 220;
 const settleIme = () => {
     const el = document.activeElement;
     if (!el?.isContentEditable) return null;
     el.blur();
-    return new Promise((done) => setTimeout(done, 30));
+    return new Promise((done) => setTimeout(done, IME_SETTLE_MS));
 };
 
 // Parse a repo reference to follow: a pasted share URL (?owner=&ns=&note=), or
@@ -1116,10 +1123,18 @@ export default function App({ address, onLogout }) {
     // behaving and there's nothing to read. Surface it in the status bar, which
     // is already the place this app says things went wrong.
     useEffect(() => {
-        const onErr = (e) => setStatus({
-            kind: "err",
-            text: `js: ${e.message ?? e.reason?.message ?? String(e.reason)}`,
-        });
+        const onErr = (e) => {
+            const text = e.message ?? e.reason?.message ?? String(e.reason);
+            // …except this one. It is slate-react's Android input manager
+            // firing a queued flush after <Editable> unmounted (see settleIme).
+            // The timers live inside the library and it cancels none of them on
+            // unmount, so no try/catch of ours is on that stack — settleIme
+            // narrows the window, it cannot close it. By the time this throws
+            // the editor is gone and the text is already saved; all it can
+            // still do is put a wall of stringified document on the screen.
+            if (text?.startsWith("Cannot resolve a DOM node")) return;
+            setStatus({ kind: "err", text: `js: ${text}` });
+        };
         window.addEventListener("error", onErr);
         window.addEventListener("unhandledrejection", onErr);
         return () => {
@@ -1140,20 +1155,22 @@ export default function App({ address, onLogout }) {
     // marks up in HomeRow: feedback that lasts exactly as long as a gesture and
     // re-renders nothing is a DOM class.
     useEffect(() => {
-        let last = 0, down = false;
+        let last = 0, down = false, until = 0;
         const onScroll = (e) => {
             const y = e.target?.scrollTop ?? 0;
-            // Collapsing the bars CHANGES THE PANE'S HEIGHT, which nudges
-            // scrollTop, which fires scroll, which would flip the state back —
-            // the oscillation you feel as jitter. Ignoring moves smaller than
-            // the bars are tall breaks that loop; a real flick clears it by an
-            // order of magnitude.
+            // A flip moves the search bar, which resizes the pane, which fires
+            // scroll again. Deaf for the length of the transition, so a change
+            // can't re-trigger itself — the same trick as the split's scroll
+            // sync locking for a frame.
+            if (performance.now() < until) { last = y; return; }
+            // A finger drifting a few pixels is not a direction.
             if (Math.abs(y - last) < 24) return;
             // Past 48px, so nothing flickers on the rubber-band at the top.
             const next = y > 48 && y > last;
             last = y;
             if (next === down) return;
             down = next;
+            until = performance.now() + 260;
             mainRef.current?.classList.toggle("scrolled-down", down);
         };
         document.addEventListener("scroll", onScroll, true);
@@ -1481,6 +1498,10 @@ export default function App({ address, onLogout }) {
     // Every "leave the document" button — Done, the breadcrumb, the rail, the
     // thumb bar. Same reason as openNote's settle: see settleIme.
     const leaveTo = async (which) => { await settleIme(); setHome(which); };
+    // Read view unmounts <Editable> outright (see MarkdownSlate), so switching
+    // into it mid-word is the same hazard as leaving the note — and it was the
+    // one route out that wasn't settling.
+    const changeView = async (mode) => { await settleIme(); setView(mode); };
 
     const navigate = async (path) => {
         if (notes.some((n) => n.path === path)) await openNote(path);
@@ -1699,7 +1720,7 @@ export default function App({ address, onLogout }) {
                                        costs a third of the switch's width. */
                                     className={`view-btn ${m} ${view === m ? "active" : ""}`}
                                     aria-pressed={view === m}
-                                    onClick={() => setView(m)}
+                                    onClick={() => changeView(m)}
                                     title={
                                         m === "edit" ? "Markdown source only"
                                             : m === "split" ? "Source beside the rendered document"
@@ -1885,7 +1906,7 @@ export default function App({ address, onLogout }) {
                                 getToken={getAccessToken}
                                 readOnly={!repo.writable}
                                 view={view}
-                                onViewChange={setView}
+                                onViewChange={changeView}
                                 onText={setRenderText}
                                 previewText={renderText}
                             />
@@ -1897,7 +1918,7 @@ export default function App({ address, onLogout }) {
                                 noteKey={active}
                                 readOnly={!repo?.writable}
                                 view={view}
-                                onViewChange={setView}
+                                onViewChange={changeView}
                             />
                         )}
                         {activeBacklinks.length > 0 && (

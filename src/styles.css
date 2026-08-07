@@ -1122,12 +1122,6 @@ body {
    full-screen palette, so the drawer is only for switching collections — a thing you
    do rarely. That's the fix; the rules below are just fit. */
 @media (max-width: 720px) {
-    /* The app becomes a column so the thumb bar can be its last row — see the
-       .thumbbar rules below. The sidebar is taken out of flow just underneath,
-       so it doesn't become a row of this column. */
-    .app { flex-direction: column; }
-    .main { min-height: 0; } /* a column's flex child won't scroll internally without it */
-
     .sidebar {
         position: fixed;
         top: 0;
@@ -1213,30 +1207,32 @@ body {
        regripping, so the actions you repeat live there. `env(safe-area-inset-
        bottom)` keeps the row off the iPhone home indicator, which otherwise
        swallows the bottom ~34px of any bar flush with the edge. */
+    /* Fixed, and it hides by TRANSFORM — never by height.
+       A bar that collapses its own height resizes the pane above it, which
+       moves scrollTop, which fires scroll, which re-decides whether to hide:
+       the bar animates against itself for as long as your finger is moving.
+       That was the jitter. A transform is composited — the pane's layout never
+       changes, so the loop has nothing to feed on. Everything that scrolls
+       clears the bar with bottom padding instead (see .home-list; the editor
+       panes already end in 45vh of runway). */
     .thumbbar {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 12; /* under the drawer (20) and the palette (60) */
         display: flex;
         gap: 8px;
         padding: 8px 12px;
         padding-bottom: calc(8px + env(safe-area-inset-bottom));
         border-top: 1px solid var(--edge);
         background: var(--shade);
-        /* Finite, so the collapse below has somewhere to go. */
-        max-height: 96px;
-        overflow: hidden;
-        transition: max-height 0.18s ease, padding 0.18s ease, opacity 0.14s ease;
+        transition: transform 0.18s ease;
     }
-    /* In a document, the bar ducks on the same signal the search bar does —
-       and typing at the bottom of a note IS a scroll down, which is exactly
-       when four buttons in the way are worst. With the keyboard up there are
-       only a few lines of document visible; this gives them back. Flick up and
-       both bars return together. */
-    .main.scrolled-down ~ .thumbbar.editing {
-        max-height: 0;
-        padding-top: 0;
-        padding-bottom: 0;
-        opacity: 0;
-        border-top-width: 0;
-    }
+    /* In a document only: typing at the bottom of a note IS a scroll down,
+       which is exactly when four buttons in the way are worst. Flick up and it
+       comes back. On the browsing lists it stays — there it's the navigation. */
+    .main.scrolled-down ~ .thumbbar.editing { transform: translateY(105%); }
     .thumb-act {
         flex: 1;
         min-width: 0;
@@ -1278,9 +1274,9 @@ body {
        ✓ Done included, which the thumb bar now carries in the corner a thumb
        is already resting in. */
     .home-bar > .btn, .done-edit { display: none; }
-    /* Nothing scrolls under the bar any more, so the list no longer needs a
-       runway of empty rows to be reachable past a floating control. */
-    .home-list { padding-bottom: 6vh; }
+    /* Clears the fixed thumb bar — the last row has to be tappable, not parked
+       under it. */
+    .home-list { padding-bottom: 96px; }
 
     /* ── Search, out of the way while you read ──────────
        Scrolling down through a document means you're reading it, and 44px of
@@ -1295,7 +1291,10 @@ body {
            finite number for the transition to have somewhere to go. */
         max-height: 56px;
         overflow: hidden;
-        transition: max-height 0.18s ease, padding 0.18s ease, opacity 0.14s ease;
+        /* No transition. This one IS in flow — it's above the scrolling pane,
+           so its height is the pane's height — and animating that meant 180ms
+           of the document resizing under a moving finger. One frame of change
+           reads as the bar getting out of the way; 180ms reads as jitter. */
     }
     .main.scrolled-down .search-bar {
         max-height: 0;
